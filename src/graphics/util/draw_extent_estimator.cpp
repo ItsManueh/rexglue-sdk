@@ -24,8 +24,13 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
-                    "Execute unclipped draw vertex shader on CPU");
+// On like upstream Xenia: without it, draws with clipping disabled (clears, full-screen passes)
+// are assumed to cover the whole EDRAM, causing spurious render target ownership transfers.
+// Black Ops at 2x resolution: transfers 26 -> 12 ms of GPU per frame, menu 20 -> 30 FPS.
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
+                    "Execute the vertex shader of unclipped draws (clears, screen-space passes) "
+                    "on the CPU to estimate the EDRAM area really used, avoiding spurious render "
+                    "target transfers");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
                     "Execute unclipped draw VS on CPU with scissor");

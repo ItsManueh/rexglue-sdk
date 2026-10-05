@@ -199,7 +199,21 @@ class KernelState {
 
   xam::AppManager* app_manager() const { return app_manager_.get(); }
   xam::ContentManager* content_manager() const { return content_manager_.get(); }
-  xam::UserProfile* user_profile() const { return user_profile_.get(); }
+  xam::UserProfile* user_profile() const { return user_profiles_[0].get(); }
+  /// Profile of a local user (0-3); out of range returns the main profile.
+  xam::UserProfile* user_profile(uint32_t user_index) const {
+    return user_profiles_[user_index < kMaxLocalUsers ? user_index : 0].get();
+  }
+  /// User 0 is always signed in. Users 1-3 are signed in to a local offline profile while a
+  /// controller is connected to their slot, when split screen profiles are enabled.
+  bool IsUserSignedIn(uint32_t user_index) const;
+  uint32_t signed_in_user_mask() const;
+  /// Index of the signed in local user with this XUID, or kMaxLocalUsers.
+  uint32_t UserIndexFromXuid(uint64_t xuid) const;
+  /// Called by the input system when the set of connected users changes (bit N = user N).
+  void OnInputUsersChanged(uint32_t connected_mask);
+
+  static constexpr uint32_t kMaxLocalUsers = 4;
 
   // Access must be guarded by the global critical region.
   util::ObjectTable* object_table() { return &object_table_; }
@@ -353,7 +367,9 @@ class KernelState {
 
   std::unique_ptr<xam::AppManager> app_manager_;
   std::unique_ptr<xam::ContentManager> content_manager_;
-  std::unique_ptr<xam::UserProfile> user_profile_;
+  std::unique_ptr<xam::UserProfile> user_profiles_[kMaxLocalUsers];
+  std::atomic<uint32_t> input_user_mask_{0};
+  std::atomic<uint32_t> notified_signin_mask_{1};
 
   rex::thread::global_critical_region global_critical_region_;
 

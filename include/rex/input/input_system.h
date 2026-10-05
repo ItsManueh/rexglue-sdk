@@ -10,6 +10,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -47,6 +49,11 @@ class InputSystem : public system::IInputSystem {
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
+  uint32_t ConnectedUserMask() const override {
+    return connected_user_mask_.load(std::memory_order_relaxed);
+  }
+  void SetUsersChangedCallback(std::function<void(uint32_t)> callback) override;
+
  private:
   /// Re-enumerates every driver and notifies the assignment when the set
   /// changed.
@@ -65,6 +72,11 @@ class InputSystem : public system::IInputSystem {
   // does not renumber pad two.
   std::vector<DeviceInfo> devices_;
   std::vector<InputDriver*> device_owners_;
+
+  /// Recomputes connected_user_mask_ and reports a change.
+  void UpdateConnectedUsers();
+  std::atomic<uint32_t> connected_user_mask_{0};
+  std::function<void(uint32_t)> users_changed_callback_;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

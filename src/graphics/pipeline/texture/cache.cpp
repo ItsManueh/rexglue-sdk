@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <utility>
 
+#include <fmt/format.h>
+
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
@@ -292,6 +294,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       ResetTextureBindings();
     }
     // Remove the texture from the map and destroy it via its unique_ptr.
+    ++stats_.destroyed;
     auto found_texture_it = textures_.find(texture->key());
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
@@ -875,6 +878,13 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
   }
+  ++stats_.created;
+  if (collect_stats_) {
+    ++stats_.created_kinds[fmt::format(
+        "{} {} {} {}x{}x{} base {:03X}xxxxx", key.tiled ? "tiled" : "linear",
+        key.GetLogDimensionName(), FormatInfo::Get(key.format)->name, key.GetWidth(),
+        key.GetHeight(), key.GetDepthOrArraySize(), (key.base_page << 12) >> 20)];
+  }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
   return texture;
@@ -887,6 +897,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   if (!PrepareTextureLoad(texture, pending_load, pending_ranges, pending_range_count)) {
     return true;
   }
+  ++stats_.loaded;
 
   std::pair<uint32_t, uint32_t> pending_range_pairs[2];
   for (size_t i = 0; i < pending_range_count; ++i) {

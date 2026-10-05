@@ -37,6 +37,13 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_INT32(gpu_command_thread_priority, 0, "GPU",
+                     "Windows priority of the thread that processes the guest GPU commands: 0 = "
+                     "normal, 1 = above normal, 2 = highest. Higher keeps it on a core when the "
+                     "guest threads that wait for it are spinning")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -143,6 +150,10 @@ bool CommandProcessor::Initialize() {
       }));
   worker_thread_->set_name("GPU Commands");
   worker_thread_->Create();
+  if (int32_t priority = REXCVAR_GET(gpu_command_thread_priority);
+      priority > 0 && worker_thread_->thread()) {
+    worker_thread_->thread()->set_priority(priority);
+  }
 
   return true;
 }

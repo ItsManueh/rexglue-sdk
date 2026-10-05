@@ -26,6 +26,13 @@ class D3D12Provider : public GraphicsProvider {
 
   static std::unique_ptr<D3D12Provider> Create();
 
+  // Diagnostics: logs (once per process) the first queue operation after which the device
+  // is found removed. Cheap enough to call after every submission.
+  void CheckDeviceLost(const char* after_operation) const;
+  // Diagnostics (d3d12_probe_recording): records and closes a one-command list to detect
+  // the first operation after which command recording stops working.
+  void ProbeRecording(const char* after_operation) const;
+
   std::unique_ptr<Presenter> CreatePresenter(Presenter::HostGpuLossCallback host_gpu_loss_callback =
                                                  Presenter::FatalErrorHostGpuLossCallback) override;
 

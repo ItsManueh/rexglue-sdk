@@ -13,6 +13,8 @@
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
+
+#include <fmt/format.h>
 #include <rex/graphics/flags.h>
 #include <rex/math.h>
 
@@ -29,7 +31,9 @@ void DeferredCommandList::Reset() {
 }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
-                                  ID3D12GraphicsCommandList1* command_list_1) {
+                                  ID3D12GraphicsCommandList1* command_list_1,
+                                  size_t command_limit) {
+  size_t commands_executed = 0;
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -37,6 +41,9 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
   size_t stream_remaining = command_stream_.size();
   ID3D12PipelineState* current_pipeline_state = nullptr;
   while (stream_remaining != 0) {
+    if (commands_executed++ >= command_limit) {
+      break;
+    }
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
     stream_remaining -= kCommandHeaderSizeElements;
@@ -275,6 +282,191 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
   }
+}
+
+size_t DeferredCommandList::GetCommandCount() const {
+  size_t count = 0;
+  const uintmax_t* stream = command_stream_.data();
+  size_t stream_remaining = command_stream_.size();
+  while (stream_remaining != 0) {
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+    size_t size = kCommandHeaderSizeElements + header.arguments_size_elements;
+    stream += size;
+    stream_remaining -= size;
+    ++count;
+  }
+  return count;
+}
+
+namespace {
+std::string DescribeTextureCopyLocation(const D3D12_TEXTURE_COPY_LOCATION& location) {
+  if (!location.pResource) {
+    return "null";
+  }
+  D3D12_RESOURCE_DESC desc = location.pResource->GetDesc();
+  std::string resource = fmt::format(
+      "{} {}x{}x{} fmt {} mips {}",
+      desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? "buffer" : "texture", desc.Width,
+      desc.Height, desc.DepthOrArraySize, int(desc.Format), desc.MipLevels);
+  if (location.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+    return fmt::format("[{} subresource {}]", resource, location.SubresourceIndex);
+  }
+  const auto& f = location.PlacedFootprint;
+  return fmt::format("[{} footprint offset {} {}x{}x{} pitch {} fmt {}]", resource, f.Offset,
+                     f.Footprint.Width, f.Footprint.Height, f.Footprint.Depth,
+                     f.Footprint.RowPitch, int(f.Footprint.Format));
+}
+
+uint64_t ResourceWidth(ID3D12Resource* resource) {
+  return resource ? resource->GetDesc().Width : 0;
+}
+}  // namespace
+
+std::string DeferredCommandList::DescribeCommand(size_t command_index) const {
+  const uintmax_t* stream = command_stream_.data();
+  size_t stream_remaining = command_stream_.size();
+  for (size_t i = 0; stream_remaining != 0; ++i) {
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+    const uintmax_t* args_ptr = stream + kCommandHeaderSizeElements;
+    if (i == command_index) {
+      std::string text = fmt::format("command type {}", int(header.command));
+      switch (header.command) {
+        case Command::kD3DCopyBufferRegion: {
+          auto& a = *reinterpret_cast<const D3DCopyBufferRegionArguments*>(args_ptr);
+          text += fmt::format(
+              " CopyBufferRegion dst {} (size {}) +{} <- src {} (size {}) +{}, {} bytes",
+              static_cast<void*>(a.dst_buffer), ResourceWidth(a.dst_buffer), a.dst_offset,
+              static_cast<void*>(a.src_buffer), ResourceWidth(a.src_buffer), a.src_offset,
+              a.num_bytes);
+        } break;
+        case Command::kD3DCopyResource: {
+          auto& a = *reinterpret_cast<const D3DCopyResourceArguments*>(args_ptr);
+          text += fmt::format(" CopyResource dst {} <- src {}", static_cast<void*>(a.dst_resource),
+                              static_cast<void*>(a.src_resource));
+        } break;
+        case Command::kCopyTexture: {
+          auto& a = *reinterpret_cast<const CopyTextureArguments*>(args_ptr);
+          text += " CopyTexture dst " + DescribeTextureCopyLocation(a.dst) + " <- src " +
+                  DescribeTextureCopyLocation(a.src);
+        } break;
+        case Command::kD3DCopyTextureRegion: {
+          auto& a = *reinterpret_cast<const D3DCopyTextureRegionArguments*>(args_ptr);
+          text += fmt::format(" CopyTextureRegion dst {} at ({}, {}, {}) <- src {}",
+                              DescribeTextureCopyLocation(a.dst), a.dst_x, a.dst_y, a.dst_z,
+                              DescribeTextureCopyLocation(a.src));
+          if (a.has_src_box) {
+            text += fmt::format(" box ({}, {}, {})-({}, {}, {})", a.src_box.left, a.src_box.top,
+                                a.src_box.front, a.src_box.right, a.src_box.bottom,
+                                a.src_box.back);
+          }
+        } break;
+        case Command::kD3DDispatch: {
+          auto& a = *reinterpret_cast<const D3DDispatchArguments*>(args_ptr);
+          text += fmt::format(" Dispatch {}x{}x{}", a.thread_group_count_x,
+                              a.thread_group_count_y, a.thread_group_count_z);
+        } break;
+        case Command::kD3DResourceBarrier: {
+          UINT count = *reinterpret_cast<const UINT*>(args_ptr);
+          auto barriers = reinterpret_cast<const D3D12_RESOURCE_BARRIER*>(
+              reinterpret_cast<const uint8_t*>(args_ptr) +
+              rex::align(sizeof(UINT), alignof(D3D12_RESOURCE_BARRIER)));
+          text += fmt::format(" ResourceBarrier x{}:", count);
+          for (UINT b = 0; b < count; ++b) {
+            const D3D12_RESOURCE_BARRIER& barrier = barriers[b];
+            if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+              text += fmt::format(" [transition {} sub {} 0x{:X}->0x{:X} flags {}]",
+                                  static_cast<void*>(barrier.Transition.pResource),
+                                  barrier.Transition.Subresource,
+                                  unsigned(barrier.Transition.StateBefore),
+                                  unsigned(barrier.Transition.StateAfter),
+                                  unsigned(barrier.Flags));
+            } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+              text += fmt::format(" [uav {}]", static_cast<void*>(barrier.UAV.pResource));
+            } else {
+              text += fmt::format(" [aliasing {} -> {}]",
+                                  static_cast<void*>(barrier.Aliasing.pResourceBefore),
+                                  static_cast<void*>(barrier.Aliasing.pResourceAfter));
+            }
+          }
+        } break;
+        case Command::kRSSetScissorRect: {
+          auto& r = *reinterpret_cast<const D3D12_RECT*>(args_ptr);
+          text += fmt::format(" RSSetScissorRect ({}, {})-({}, {})", r.left, r.top, r.right,
+                              r.bottom);
+        } break;
+        case Command::kRSSetViewport: {
+          auto& v = *reinterpret_cast<const D3D12_VIEWPORT*>(args_ptr);
+          text += fmt::format(" RSSetViewport ({}, {}) {}x{} depth {}..{}", v.TopLeftX,
+                              v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth);
+        } break;
+        case Command::kD3DClearRenderTargetView: {
+          auto& a = *reinterpret_cast<const ClearRenderTargetViewHeader*>(args_ptr);
+          auto rects = reinterpret_cast<const D3D12_RECT*>(&a + 1);
+          text += " ClearRenderTargetView";
+          for (UINT r = 0; r < a.num_rects && r < 8; ++r) {
+            text += fmt::format(" ({}, {})-({}, {})", rects[r].left, rects[r].top,
+                                rects[r].right, rects[r].bottom);
+          }
+        } break;
+        case Command::kD3DClearDepthStencilView: {
+          auto& a = *reinterpret_cast<const ClearDepthStencilViewHeader*>(args_ptr);
+          auto rects = reinterpret_cast<const D3D12_RECT*>(&a + 1);
+          text += " ClearDepthStencilView";
+          for (UINT r = 0; r < a.num_rects && r < 8; ++r) {
+            text += fmt::format(" ({}, {})-({}, {})", rects[r].left, rects[r].top,
+                                rects[r].right, rects[r].bottom);
+          }
+        } break;
+        case Command::kD3DSetSamplePositions: {
+          auto& a = *reinterpret_cast<const D3DSetSamplePositionsArguments*>(args_ptr);
+          text += fmt::format(" SetSamplePositions {} samples x {} pixels:",
+                              a.num_samples_per_pixel, a.num_pixels);
+          for (UINT i = 0; i < std::min(a.num_samples_per_pixel * a.num_pixels, 16u); ++i) {
+            text += fmt::format(" ({}, {})", int(a.sample_positions[i].X),
+                                int(a.sample_positions[i].Y));
+          }
+        } break;
+        case Command::kD3DOMSetRenderTargets: {
+          auto& a = *reinterpret_cast<const D3DOMSetRenderTargetsArguments*>(args_ptr);
+          text += fmt::format(" OMSetRenderTargets {} RTVs (single range {}), depth {}",
+                              a.num_render_target_descriptors,
+                              a.rts_single_handle_to_descriptor_range, a.depth_stencil);
+        } break;
+        case Command::kD3DDrawInstanced: {
+          auto& a = *reinterpret_cast<const D3DDrawInstancedArguments*>(args_ptr);
+          text += fmt::format(" DrawInstanced {} vertices x {} from {}", a.vertex_count_per_instance,
+                              a.instance_count, a.start_vertex_location);
+        } break;
+        case Command::kD3DDrawIndexedInstanced: {
+          auto& a = *reinterpret_cast<const D3DDrawIndexedInstancedArguments*>(args_ptr);
+          text += fmt::format(" DrawIndexedInstanced {} indices x {} from {} base {}",
+                              a.index_count_per_instance, a.instance_count,
+                              a.start_index_location, a.base_vertex_location);
+        } break;
+        case Command::kSetDescriptorHeaps: {
+          auto& a = *reinterpret_cast<const SetDescriptorHeapsArguments*>(args_ptr);
+          text += fmt::format(" SetDescriptorHeaps view {} sampler {}",
+                              static_cast<void*>(a.cbv_srv_uav_descriptor_heap),
+                              static_cast<void*>(a.sampler_descriptor_heap));
+          for (ID3D12DescriptorHeap* heap :
+               {a.cbv_srv_uav_descriptor_heap, a.sampler_descriptor_heap}) {
+            if (heap) {
+              D3D12_DESCRIPTOR_HEAP_DESC desc = heap->GetDesc();
+              text += fmt::format(" [type {} count {} flags {}]", int(desc.Type),
+                                  desc.NumDescriptors, int(desc.Flags));
+            }
+          }
+        } break;
+        default:
+          break;
+      }
+      return text;
+    }
+    size_t size = kCommandHeaderSizeElements + header.arguments_size_elements;
+    stream += size;
+    stream_remaining -= size;
+  }
+  return "out of range";
 }
 
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {

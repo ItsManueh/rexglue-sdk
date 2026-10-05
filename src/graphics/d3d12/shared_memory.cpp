@@ -297,6 +297,7 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
   direct_queue->UpdateTileMappings(buffer_, 1, &region_start_coordinates, &region_size, heap, 1,
                                    &range_flags, &heap_range_start_offset, &region_size.NumTiles,
                                    D3D12_TILE_MAPPING_FLAG_NONE);
+  command_processor_.GetD3D12Provider().ProbeRecording("shared memory UpdateTileMappings");
   command_processor_.NotifyQueueOperationsDoneDirectly();
   return true;
 }
@@ -327,6 +328,7 @@ bool D3D12SharedMemory::UploadRanges(
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
+      stat_uploaded_[(upload_range_start << page_size_log2()) >> 20] += upload_buffer_size;
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));

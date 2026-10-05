@@ -10,6 +10,9 @@
  */
 
 #include <cstdlib>
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -19,6 +22,42 @@
 #include <rex/ui/d3d12/d3d12_provider.h>
 
 #include <malloc.h>
+
+namespace {
+// Debug layer message sink: each message ID is logged at most 32 times so a per-draw error
+// can't flood the log or stall the game.
+void __stdcall DebugLayerMessageCallback(D3D12_MESSAGE_CATEGORY category,
+                                         D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id,
+                                         LPCSTR description, void* context) {
+  if (severity > D3D12_MESSAGE_SEVERITY_WARNING) {
+    return;
+  }
+  static std::mutex counts_mutex;
+  static std::unordered_map<int, uint32_t> counts;
+  uint32_t count;
+  {
+    std::lock_guard<std::mutex> lock(counts_mutex);
+    count = ++counts[int(id)];
+  }
+  if (count > 32) {
+    return;
+  }
+  const char* severity_name = severity == D3D12_MESSAGE_SEVERITY_WARNING ? "warning"
+                              : severity == D3D12_MESSAGE_SEVERITY_ERROR ? "error"
+                                                                         : "corruption";
+  if (severity == D3D12_MESSAGE_SEVERITY_WARNING) {
+    REXLOG_WARN("D3D12 debug {} (id {}, category {}){}: {}", severity_name, int(id),
+                int(category), count == 32 ? " [last report]" : "", description);
+  } else {
+    REXLOG_ERROR("D3D12 debug {} (id {}, category {}){}: {}", severity_name, int(id),
+                 int(category), count == 32 ? " [last report]" : "", description);
+  }
+}
+}  // namespace
+
+REXCVAR_DEFINE_BOOL(d3d12_probe_recording, false, "UI/D3D12",
+                    "Diagnostics: check after every queue operation that command lists can still "
+                    "be recorded (slow)");
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -38,6 +77,55 @@ REXCVAR_DEFINE_INT32(d3d12_queue_priority, 1, "UI/D3D12",
     .range(0, 2);
 
 namespace rex::ui::d3d12 {
+
+void D3D12Provider::ProbeRecording(const char* after_operation) const {
+  CheckDeviceLost(after_operation);
+  if (!REXCVAR_GET(d3d12_probe_recording) || !device_) {
+    return;
+  }
+  static std::mutex probe_mutex;
+  static ID3D12CommandAllocator* allocator = nullptr;
+  static ID3D12GraphicsCommandList* list = nullptr;
+  static bool reported = false;
+  static uint64_t probe_count = 0;
+  std::lock_guard<std::mutex> lock(probe_mutex);
+  if (reported) {
+    return;
+  }
+  if (!allocator) {
+    if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(&allocator))) ||
+        FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
+                                          IID_PPV_ARGS(&list)))) {
+      reported = true;
+      REXLOG_ERROR("D3D12 recording probe: couldn't create the probe command list");
+      return;
+    }
+    list->Close();
+  }
+  ++probe_count;
+  allocator->Reset();
+  list->Reset(allocator, nullptr);
+  list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  HRESULT result = list->Close();
+  if (FAILED(result)) {
+    reported = true;
+    REXLOG_ERROR("D3D12 recording probe #{} failed (0x{:08X}) right after: {}", probe_count,
+                 static_cast<unsigned>(result), after_operation);
+  }
+}
+
+void D3D12Provider::CheckDeviceLost(const char* after_operation) const {
+  static std::atomic<bool> reported{false};
+  if (!device_ || reported.load(std::memory_order_relaxed)) {
+    return;
+  }
+  HRESULT reason = device_->GetDeviceRemovedReason();
+  if (FAILED(reason) && !reported.exchange(true)) {
+    REXLOG_ERROR("D3D12 device lost (0x{:08X}), first noticed right after: {}",
+                 static_cast<unsigned>(reason), after_operation);
+  }
+}
 
 bool D3D12Provider::IsD3D12APIAvailable() {
   HMODULE library_d3d12 = LoadLibraryW(L"D3D12.dll");
@@ -352,6 +440,21 @@ bool D3D12Provider::Initialize() {
       d3d12_info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
     }
     d3d12_info_queue->Release();
+  }
+  // With the debug layer, also route its warnings and errors to the log (otherwise they only
+  // reach an attached debugger). ID3D12InfoQueue1 needs a recent runtime (Windows 11 or the
+  // Agility SDK); older runtimes simply don't get the callback.
+  if (debug) {
+    ID3D12InfoQueue1* d3d12_info_queue_1;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&d3d12_info_queue_1)))) {
+      DWORD callback_cookie = 0;
+      if (SUCCEEDED(d3d12_info_queue_1->RegisterMessageCallback(
+              DebugLayerMessageCallback, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr,
+              &callback_cookie))) {
+        REXLOG_INFO("Direct3D 12 debug layer messages are written to the log");
+      }
+      d3d12_info_queue_1->Release();
+    }
   }
 
   // Create the command queue for graphics.

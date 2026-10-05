@@ -31,8 +31,8 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
-REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
-    .allowed({"none", "fxaa", "fxaa_extreme"})
+REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme, smaa")
+    .allowed({"none", "fxaa", "fxaa_extreme", "smaa"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
@@ -50,6 +50,9 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
   });
   if (lowered == "fxaa") {
     return rex::graphics::CommandProcessor::SwapPostEffect::kFxaa;
+  }
+  if (lowered == "smaa") {
+    return rex::graphics::CommandProcessor::SwapPostEffect::kSmaa;
   }
   if (lowered == "fxaa_extreme" || lowered == "extreme") {
     return rex::graphics::CommandProcessor::SwapPostEffect::kFxaaExtreme;

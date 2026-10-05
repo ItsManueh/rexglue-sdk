@@ -2427,8 +2427,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         const VkDevice device = vulkan_device->device();
 
         uint32_t swap_frame_index = uint32_t(frame_current_ % kMaxFramesInFlight);
+        // SMAA is implemented only on D3D12: use FXAA instead on Vulkan.
         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
-                        swap_post_effect == SwapPostEffect::kFxaaExtreme;
+                        swap_post_effect == SwapPostEffect::kFxaaExtreme ||
+                        swap_post_effect == SwapPostEffect::kSmaa;
 
         // This is according to D3D::InitializePresentationParameters from a
         // game executable, which initializes the 256-entry table gamma ramp for

@@ -32,6 +32,17 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DEFINE_BOOL(d3d12_gpu_profile, false, "GPU/D3D12",
+                    "Diagnostics: measure GPU time per kind of work (draws, render target "
+                    "transfers, texture loads, resolves, swap) and log it every 10 seconds")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(smaa_preset, "high", "GPU",
+                      "SMAA quality (swap_post_effect = smaa): high (luma edges) or ultra (color "
+                      "edges, lower threshold, longer searches; catches more edges for a little "
+                      "more GPU time)")
+    .allowed({"high", "ultra"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -58,7 +69,17 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/fxaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/smaa_blending_weight_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/smaa_edge_detection_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/smaa_neighborhood_blending_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/smaa_edge_detection_ultra_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/smaa_blending_weight_ultra_cs.h"
 }  // namespace shaders
+
+namespace smaa_lookup {
+#include "../shaders/smaa/AreaTex.h"
+#include "../shaders/smaa/SearchTex.h"
+}  // namespace smaa_lookup
 
 D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
@@ -866,6 +887,32 @@ bool D3D12CommandProcessor::SetupContext() {
   ID3D12Device* device = provider.GetDevice();
   ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
 
+  if (REXCVAR_GET(d3d12_gpu_profile)) {
+    D3D12_QUERY_HEAP_DESC query_heap_desc = {};
+    query_heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_heap_desc.Count = kGpuProfileQueries;
+    D3D12_RESOURCE_DESC readback_desc;
+    ui::d3d12::util::FillBufferResourceDesc(readback_desc, uint64_t(kGpuProfileQueries) * 8,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    D3D12_HEAP_PROPERTIES readback_heap = {D3D12_HEAP_TYPE_READBACK};
+    void* mapping = nullptr;
+    D3D12_RANGE read_range = {0, size_t(kGpuProfileQueries) * 8};
+    if (SUCCEEDED(device->CreateQueryHeap(&query_heap_desc, IID_PPV_ARGS(&gpu_profile_heap_))) &&
+        SUCCEEDED(device->CreateCommittedResource(
+            &readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr, IID_PPV_ARGS(&gpu_profile_readback_))) &&
+        SUCCEEDED(gpu_profile_readback_->Map(0, &read_range, &mapping)) &&
+        SUCCEEDED(direct_queue->GetTimestampFrequency(&gpu_profile_frequency_)) &&
+        gpu_profile_frequency_) {
+      gpu_profile_mapped_ = static_cast<const uint64_t*>(mapping);
+      gpu_profile_enabled_ = true;
+      gpu_profile_period_start_ms_ = GetTickCount64();
+      REXGPU_INFO("GPU profiling enabled (timestamp frequency {} Hz)", gpu_profile_frequency_);
+    } else {
+      REXGPU_ERROR("GPU profiling: failed to create the timestamp query heap or readback buffer");
+    }
+  }
+
   fence_completion_event_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
   if (fence_completion_event_ == nullptr) {
     REXGPU_ERROR("Failed to create the fence completion event");
@@ -1193,6 +1240,7 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize the texture cache");
     return false;
   }
+  texture_cache_->set_collect_stats(gpu_profile_enabled_);
 
   pipeline_cache_ = std::make_unique<PipelineCache>(
       *this, *register_file_, *render_target_cache_.get(), bindless_resources_used_);
@@ -1421,6 +1469,77 @@ bool D3D12CommandProcessor::SetupContext() {
   if (!fxaa_pipeline_) {
     REXGPU_ERROR("Failed to create the extreme-quality FXAA compute pipeline");
     return false;
+  }
+
+  // SMAA. Failure only disables the effect (falls back to no antialiasing), it's optional.
+  {
+    D3D12_DESCRIPTOR_RANGE smaa_ranges[4];
+    for (UINT i = 0; i < 4; ++i) {
+      smaa_ranges[i].RangeType =
+          i ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+      smaa_ranges[i].NumDescriptors = 1;
+      smaa_ranges[i].BaseShaderRegister = i ? i - 1 : 0;
+      smaa_ranges[i].RegisterSpace = 0;
+      smaa_ranges[i].OffsetInDescriptorsFromTableStart = 0;
+    }
+    D3D12_ROOT_PARAMETER smaa_root_parameters[UINT(SmaaRootParameter::kCount)];
+    D3D12_ROOT_PARAMETER& smaa_constants =
+        smaa_root_parameters[UINT(SmaaRootParameter::kConstants)];
+    smaa_constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    smaa_constants.Constants.ShaderRegister = 0;
+    smaa_constants.Constants.RegisterSpace = 0;
+    smaa_constants.Constants.Num32BitValues = sizeof(SmaaConstants) / sizeof(uint32_t);
+    smaa_constants.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    for (UINT i = 0; i < 4; ++i) {
+      D3D12_ROOT_PARAMETER& table =
+          smaa_root_parameters[UINT(SmaaRootParameter::kDestination) + i];
+      table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      table.DescriptorTable.NumDescriptorRanges = 1;
+      table.DescriptorTable.pDescriptorRanges = &smaa_ranges[i];
+      table.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_STATIC_SAMPLER_DESC smaa_samplers[2];
+    for (UINT i = 0; i < 2; ++i) {
+      smaa_samplers[i] = fxaa_root_sampler;
+      smaa_samplers[i].ShaderRegister = i;
+    }
+    // s0: linear (SMAA's LinearSampler, MIN_MAG_LINEAR_MIP_POINT), s1: point.
+    smaa_samplers[0].Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    smaa_samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    D3D12_ROOT_SIGNATURE_DESC smaa_root_signature_desc;
+    smaa_root_signature_desc.NumParameters = UINT(SmaaRootParameter::kCount);
+    smaa_root_signature_desc.pParameters = smaa_root_parameters;
+    smaa_root_signature_desc.NumStaticSamplers = 2;
+    smaa_root_signature_desc.pStaticSamplers = smaa_samplers;
+    smaa_root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    *(smaa_root_signature_.ReleaseAndGetAddressOf()) =
+        ui::d3d12::util::CreateRootSignature(provider, smaa_root_signature_desc);
+    if (smaa_root_signature_) {
+      const bool smaa_ultra = REXCVAR_GET(smaa_preset) == "ultra";
+      const std::pair<const void*, size_t> smaa_shaders[3] = {
+          smaa_ultra ? std::pair<const void*, size_t>{shaders::smaa_edge_detection_ultra_cs,
+                                                      sizeof(shaders::smaa_edge_detection_ultra_cs)}
+                     : std::pair<const void*, size_t>{shaders::smaa_edge_detection_cs,
+                                                      sizeof(shaders::smaa_edge_detection_cs)},
+          smaa_ultra
+              ? std::pair<const void*, size_t>{shaders::smaa_blending_weight_ultra_cs,
+                                               sizeof(shaders::smaa_blending_weight_ultra_cs)}
+              : std::pair<const void*, size_t>{shaders::smaa_blending_weight_cs,
+                                               sizeof(shaders::smaa_blending_weight_cs)},
+          {shaders::smaa_neighborhood_blending_cs, sizeof(shaders::smaa_neighborhood_blending_cs)},
+      };
+      for (size_t i = 0; i < 3; ++i) {
+        *(smaa_pipelines_[i].ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
+            device, smaa_shaders[i].first, smaa_shaders[i].second, smaa_root_signature_.Get());
+      }
+    }
+    if (!smaa_root_signature_ || !smaa_pipelines_[0] || !smaa_pipelines_[1] ||
+        !smaa_pipelines_[2]) {
+      REXGPU_WARN("Failed to create the SMAA pipelines - SMAA will be unavailable");
+      for (auto& pipeline : smaa_pipelines_) {
+        pipeline.Reset();
+      }
+    }
   }
 
   // Resolve downscale compute pipeline for scaled readback resolve.
@@ -1685,6 +1804,16 @@ void D3D12CommandProcessor::ShutdownContext() {
   fxaa_extreme_pipeline_.Reset();
   fxaa_pipeline_.Reset();
   fxaa_root_signature_.Reset();
+
+  smaa_edges_texture_.Reset();
+  smaa_weights_texture_.Reset();
+  smaa_work_textures_submission_ = 0;
+  smaa_area_texture_.Reset();
+  smaa_search_texture_.Reset();
+  for (auto& pipeline : smaa_pipelines_) {
+    pipeline.Reset();
+  }
+  smaa_root_signature_.Reset();
   resolve_downscale_pipeline_.Reset();
   resolve_downscale_root_signature_.Reset();
 
@@ -1891,9 +2020,134 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_up_to_date_ = false;
 }
 
+bool D3D12CommandProcessor::PrepareSmaaResources(uint32_t width, uint32_t height) {
+  if (!smaa_pipelines_[0]) {
+    return false;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  auto create_texture = [&](uint32_t texture_width, uint32_t texture_height, DXGI_FORMAT format,
+                            D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state,
+                            Microsoft::WRL::ComPtr<ID3D12Resource>& texture_out) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = texture_width;
+    desc.Height = texture_height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = flags;
+    return SUCCEEDED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                                     provider.GetHeapFlagCreateNotZeroed(), &desc,
+                                                     state, nullptr, IID_PPV_ARGS(&texture_out)));
+  };
+
+  // Constant lookup textures, uploaded once through a temporary upload buffer that is released
+  // when this submission completes.
+  if (!smaa_area_texture_ || !smaa_search_texture_) {
+    smaa_area_texture_.Reset();
+    smaa_search_texture_.Reset();
+    if (!create_texture(AREATEX_WIDTH, AREATEX_HEIGHT, DXGI_FORMAT_R8G8_UNORM,
+                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
+                        smaa_area_texture_) ||
+        !create_texture(SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, DXGI_FORMAT_R8_UNORM,
+                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
+                        smaa_search_texture_)) {
+      REXGPU_ERROR("SMAA: failed to create the lookup textures");
+      smaa_area_texture_.Reset();
+      smaa_search_texture_.Reset();
+      return false;
+    }
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2];
+    UINT64 area_size, search_size;
+    D3D12_RESOURCE_DESC area_desc = smaa_area_texture_->GetDesc();
+    D3D12_RESOURCE_DESC search_desc = smaa_search_texture_->GetDesc();
+    device->GetCopyableFootprints(&area_desc, 0, 1, 0, &footprints[0], nullptr, nullptr,
+                                  &area_size);
+    device->GetCopyableFootprints(&search_desc, 0, 1, 0, &footprints[1], nullptr, nullptr,
+                                  &search_size);
+    footprints[1].Offset = rex::align(area_size, UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT));
+    D3D12_RESOURCE_DESC upload_desc;
+    ui::d3d12::util::FillBufferResourceDesc(upload_desc, footprints[1].Offset + search_size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+    void* mapping = nullptr;
+    if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesUpload,
+                                               D3D12_HEAP_FLAG_NONE, &upload_desc,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                               IID_PPV_ARGS(&upload))) ||
+        FAILED(upload->Map(0, nullptr, &mapping))) {
+      REXGPU_ERROR("SMAA: failed to create the lookup texture upload buffer");
+      smaa_area_texture_.Reset();
+      smaa_search_texture_.Reset();
+      return false;
+    }
+    auto* upload_bytes = static_cast<uint8_t*>(mapping);
+    for (uint32_t y = 0; y < AREATEX_HEIGHT; ++y) {
+      std::memcpy(upload_bytes + footprints[0].Offset + y * footprints[0].Footprint.RowPitch,
+                  smaa_lookup::areaTexBytes + y * AREATEX_PITCH, AREATEX_PITCH);
+    }
+    for (uint32_t y = 0; y < SEARCHTEX_HEIGHT; ++y) {
+      std::memcpy(upload_bytes + footprints[1].Offset + y * footprints[1].Footprint.RowPitch,
+                  smaa_lookup::searchTexBytes + y * SEARCHTEX_PITCH, SEARCHTEX_PITCH);
+    }
+    upload->Unmap(0, nullptr);
+    ID3D12Resource* lookup_textures[2] = {smaa_area_texture_.Get(), smaa_search_texture_.Get()};
+    for (size_t i = 0; i < 2; ++i) {
+      D3D12_TEXTURE_COPY_LOCATION source, dest;
+      source.pResource = upload.Get();
+      source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      source.PlacedFootprint = footprints[i];
+      dest.pResource = lookup_textures[i];
+      dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dest.SubresourceIndex = 0;
+      deferred_command_list_.D3DCopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+      PushTransitionBarrier(lookup_textures[i], D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    // Keep the upload buffer alive until the copies are done on the GPU.
+    resources_for_deletion_.emplace_back(submission_current_, upload.Detach());
+  }
+
+  // Work textures sized like the guest output.
+  if (smaa_edges_texture_) {
+    D3D12_RESOURCE_DESC desc = smaa_edges_texture_->GetDesc();
+    if (desc.Width != width || desc.Height != height) {
+      for (Microsoft::WRL::ComPtr<ID3D12Resource>* texture :
+           {std::addressof(smaa_edges_texture_), std::addressof(smaa_weights_texture_)}) {
+        if (*texture && submission_completed_ < smaa_work_textures_submission_) {
+          (*texture)->AddRef();
+          resources_for_deletion_.emplace_back(smaa_work_textures_submission_, texture->Get());
+        }
+        texture->Reset();
+      }
+    }
+  }
+  if (!smaa_edges_texture_ || !smaa_weights_texture_) {
+    smaa_edges_texture_.Reset();
+    smaa_weights_texture_.Reset();
+    if (!create_texture(width, height, DXGI_FORMAT_R8G8_UNORM,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, smaa_edges_texture_) ||
+        !create_texture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, smaa_weights_texture_)) {
+      REXGPU_ERROR("SMAA: failed to create the {}x{} work textures", width, height);
+      smaa_edges_texture_.Reset();
+      smaa_weights_texture_.Reset();
+      return false;
+    }
+  }
+  smaa_work_textures_submission_ = submission_current_;
+  return true;
+}
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  GpuProfileScope gpu_profile_swap(*this, GpuProfileCategory::kSwap);
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -1995,7 +2249,18 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
                         swap_post_effect == SwapPostEffect::kFxaaExtreme;
-        if (use_fxaa) {
+        bool use_smaa = swap_post_effect == SwapPostEffect::kSmaa && smaa_pipelines_[0];
+        if (swap_post_effect == SwapPostEffect::kSmaa && !use_smaa) {
+          static bool smaa_unavailable_logged = false;
+          if (!smaa_unavailable_logged) {
+            smaa_unavailable_logged = true;
+            REXGPU_WARN("SMAA requested but its pipelines are unavailable, using FXAA");
+          }
+          use_fxaa = true;
+        }
+        // FXAA and SMAA read the gamma-corrected image from an intermediate texture.
+        bool use_post_effect_source = use_fxaa || use_smaa;
+        if (use_post_effect_source) {
           // Make sure the texture of the correct size is available for FXAA.
           if (fxaa_source_texture_) {
             D3D12_RESOURCE_DESC fxaa_source_texture_desc = fxaa_source_texture_->GetDesc();
@@ -2030,6 +2295,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               REXGPU_ERROR("Failed to create the FXAA input texture");
               swap_post_effect = SwapPostEffect::kNone;
               use_fxaa = false;
+              use_smaa = false;
+              use_post_effect_source = false;
             }
           }
         }
@@ -2044,7 +2311,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
 
-        context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+        context.SetIs8bpc(!use_pwl_gamma_ramp && !use_post_effect_source);
 
         // Upload the new gamma ramp, using the upload buffer for the current
         // frame (will close the frame after this anyway, so can't write
@@ -2110,15 +2377,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
                 .resource_uav_capable();
 
-        if (use_fxaa) {
+        if (use_post_effect_source) {
           fxaa_source_texture_submission_ = submission_current_;
         }
 
         ID3D12Resource* apply_gamma_dest =
-            use_fxaa ? fxaa_source_texture_.Get() : guest_output_resource;
+            use_post_effect_source ? fxaa_source_texture_.Get() : guest_output_resource;
         D3D12_RESOURCE_STATES apply_gamma_dest_initial_state =
-            use_fxaa ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                     : ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
+            use_post_effect_source ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                   : ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
         static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
             .resource_uav_capable();
         PushTransitionBarrier(apply_gamma_dest, apply_gamma_dest_initial_state,
@@ -2126,8 +2393,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // From now on, even in case of failure, apply_gamma_dest must be
         // transitioned back to apply_gamma_dest_initial_state!
         D3D12_UNORDERED_ACCESS_VIEW_DESC apply_gamma_dest_uav_desc;
-        apply_gamma_dest_uav_desc.Format =
-            use_fxaa ? kFxaaSourceTextureFormat : ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+        apply_gamma_dest_uav_desc.Format = use_post_effect_source
+                                               ? kFxaaSourceTextureFormat
+                                               : ui::d3d12::D3D12Presenter::kGuestOutputFormat;
         apply_gamma_dest_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         apply_gamma_dest_uav_desc.Texture2D.MipSlice = 0;
         apply_gamma_dest_uav_desc.Texture2D.PlaneSlice = 0;
@@ -2236,6 +2504,101 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             PushTransitionBarrier(guest_output_resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                   ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
           }
+        } else if (use_smaa) {
+          // 3 passes x (destination + up to 3 sources): 0-1 edges, 2-5 weights, 6-8 output.
+          ui::d3d12::util::DescriptorCpuGpuHandlePair smaa_descriptors[9];
+          if (!PrepareSmaaResources(guest_output_width, guest_output_height) ||
+              !RequestOneUseSingleViewDescriptors(uint32_t(rex::countof(smaa_descriptors)),
+                                                  smaa_descriptors)) {
+            // Copy the gamma-corrected image without antialiasing.
+            PushTransitionBarrier(apply_gamma_dest, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                  D3D12_RESOURCE_STATE_COPY_SOURCE);
+            PushTransitionBarrier(guest_output_resource,
+                                  ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                                  D3D12_RESOURCE_STATE_COPY_DEST);
+            SubmitBarriers();
+            deferred_command_list_.D3DCopyResource(guest_output_resource, apply_gamma_dest);
+            PushTransitionBarrier(apply_gamma_dest, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                  apply_gamma_dest_initial_state);
+            PushTransitionBarrier(guest_output_resource, D3D12_RESOURCE_STATE_COPY_DEST,
+                                  ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+            return false;
+          }
+          auto write_uav = [&](ID3D12Resource* resource, DXGI_FORMAT format,
+                               D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+            desc.Format = format;
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            device->CreateUnorderedAccessView(resource, nullptr, &desc, handle);
+          };
+          auto write_srv = [&](ID3D12Resource* resource, DXGI_FORMAT format,
+                               D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+            desc.Format = format;
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            desc.Texture2D.MipLevels = 1;
+            device->CreateShaderResourceView(resource, &desc, handle);
+          };
+          ID3D12Resource* edges = smaa_edges_texture_.Get();
+          ID3D12Resource* weights = smaa_weights_texture_.Get();
+          ID3D12Resource* color = fxaa_source_texture_.Get();
+          write_uav(edges, DXGI_FORMAT_R8G8_UNORM, smaa_descriptors[0].first);
+          write_srv(color, kFxaaSourceTextureFormat, smaa_descriptors[1].first);
+          write_uav(weights, DXGI_FORMAT_R8G8B8A8_UNORM, smaa_descriptors[2].first);
+          write_srv(edges, DXGI_FORMAT_R8G8_UNORM, smaa_descriptors[3].first);
+          write_srv(smaa_area_texture_.Get(), DXGI_FORMAT_R8G8_UNORM, smaa_descriptors[4].first);
+          write_srv(smaa_search_texture_.Get(), DXGI_FORMAT_R8_UNORM, smaa_descriptors[5].first);
+          write_uav(guest_output_resource, ui::d3d12::D3D12Presenter::kGuestOutputFormat,
+                    smaa_descriptors[6].first);
+          write_srv(color, kFxaaSourceTextureFormat, smaa_descriptors[7].first);
+          write_srv(weights, DXGI_FORMAT_R8G8B8A8_UNORM, smaa_descriptors[8].first);
+
+          // The gamma-corrected image is the input of the edge detection and the blending.
+          PushTransitionBarrier(apply_gamma_dest, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                apply_gamma_dest_initial_state);
+          deferred_command_list_.D3DSetComputeRootSignature(smaa_root_signature_.Get());
+          SmaaConstants smaa_constants;
+          smaa_constants.rt_metrics[0] = 1.0f / float(guest_output_width);
+          smaa_constants.rt_metrics[1] = 1.0f / float(guest_output_height);
+          smaa_constants.rt_metrics[2] = float(guest_output_width);
+          smaa_constants.rt_metrics[3] = float(guest_output_height);
+          smaa_constants.size[0] = guest_output_width;
+          smaa_constants.size[1] = guest_output_height;
+          deferred_command_list_.D3DSetComputeRoot32BitConstants(
+              UINT(SmaaRootParameter::kConstants), sizeof(smaa_constants) / sizeof(uint32_t),
+              &smaa_constants, 0);
+          uint32_t smaa_group_count_x = (guest_output_width + 7) / 8;
+          uint32_t smaa_group_count_y = (guest_output_height + 7) / 8;
+          struct SmaaPass {
+            ID3D12Resource* dest;
+            D3D12_RESOURCE_STATES dest_state;
+            uint32_t first_descriptor;
+            uint32_t source_count;
+          };
+          const SmaaPass smaa_passes[3] = {
+              {edges, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0, 1},
+              {weights, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 2, 3},
+              {guest_output_resource, ui::d3d12::D3D12Presenter::kGuestOutputInternalState, 6, 2},
+          };
+          for (uint32_t pass = 0; pass < 3; ++pass) {
+            const SmaaPass& smaa_pass = smaa_passes[pass];
+            PushTransitionBarrier(smaa_pass.dest, smaa_pass.dest_state,
+                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            deferred_command_list_.D3DSetComputeRootDescriptorTable(
+                UINT(SmaaRootParameter::kDestination),
+                smaa_descriptors[smaa_pass.first_descriptor].second);
+            for (uint32_t source = 0; source < smaa_pass.source_count; ++source) {
+              deferred_command_list_.D3DSetComputeRootDescriptorTable(
+                  UINT(SmaaRootParameter::kSource0) + source,
+                  smaa_descriptors[smaa_pass.first_descriptor + 1 + source].second);
+            }
+            SetExternalPipeline(smaa_pipelines_[pass].Get());
+            SubmitBarriers();
+            deferred_command_list_.D3DDispatch(smaa_group_count_x, smaa_group_count_y, 1);
+            PushTransitionBarrier(smaa_pass.dest, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                  smaa_pass.dest_state);
+          }
         } else {
           assert_true(apply_gamma_dest_initial_state ==
                       ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
@@ -2254,6 +2617,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
+  GpuProfileFrameEnd();
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -2364,9 +2728,37 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  GpuProfileScope gpu_profile_draw(*this, GpuProfileCategory::kDraw);
+  std::optional<GpuProfileScope> gpu_profile_transfer(std::in_place, *this,
+                                                      GpuProfileCategory::kTransfer);
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
+  }
+  gpu_profile_transfer.reset();
+  if (gpu_profile_enabled_ && normalized_depth_control.stencil_enable) {
+    auto stencil_writes = [](xenos::StencilOp fail, xenos::StencilOp zpass,
+                             xenos::StencilOp zfail) {
+      return fail != xenos::StencilOp::kKeep || zpass != xenos::StencilOp::kKeep ||
+             zfail != xenos::StencilOp::kKeep;
+    };
+    bool front = stencil_writes(normalized_depth_control.stencilfail,
+                                normalized_depth_control.stencilzpass,
+                                normalized_depth_control.stencilzfail);
+    bool back = normalized_depth_control.backface_enable &&
+                stencil_writes(normalized_depth_control.stencilfail_bf,
+                               normalized_depth_control.stencilzpass_bf,
+                               normalized_depth_control.stencilzfail_bf);
+    if (front || back) {
+      ++gpu_profile_stencil_draws_;
+      if (front) {
+        gpu_profile_stencil_mask_ |= regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask;
+      }
+      if (back) {
+        gpu_profile_stencil_mask_ |=
+            reg::RB_STENCILREFMASK(regs[XE_GPU_REG_RB_STENCILREFMASK_BF]).stencilwritemask;
+      }
+    }
   }
 
   // Create the pipeline (for this, need the actually used render target formats
@@ -2407,7 +2799,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
-  texture_cache_->RequestTextures(used_texture_mask);
+  {
+    GpuProfileScope gpu_profile_textures(*this, GpuProfileCategory::kTextureLoad);
+    texture_cache_->RequestTextures(used_texture_mask);
+  }
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -2871,6 +3266,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
 }
 
 bool D3D12CommandProcessor::IssueCopy() {
+  GpuProfileScope gpu_profile_resolve(*this, GpuProfileCategory::kResolve);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -3148,6 +3544,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     // Not updated - no need to reclaim or download things.
     return;
   }
+  GpuProfileProcessCompleted();
 
   // Reclaim command allocators.
   while (command_allocator_submitted_first_) {
@@ -3192,6 +3589,171 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   primitive_processor_->CompletedSubmissionUpdated();
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+}
+
+// Re-records growing prefixes of the deferred command list into a scratch command list (never
+// executed) and bisects on Close() to find the first call the runtime rejected.
+void D3D12CommandProcessor::SetGpuProfileCategory(GpuProfileCategory category) {
+  if (gpu_profile_category_ == category) {
+    return;
+  }
+  // Close the interval of the previous kind of work before switching.
+  GpuProfileTimestamp();
+  gpu_profile_category_ = category;
+}
+
+void D3D12CommandProcessor::GpuProfileTimestamp() {
+  if (!gpu_profile_enabled_ || !gpu_profile_submission_open_) {
+    return;
+  }
+  uint32_t query = gpu_profile_current_.first_query +
+                   uint32_t(gpu_profile_current_.categories.size()) + 1;
+  if (query >= kGpuProfileQueries) {
+    // Out of queries until the next submission: the remaining time goes to the last interval.
+    return;
+  }
+  deferred_command_list_.D3DEndQuery(gpu_profile_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query);
+  gpu_profile_current_.categories.push_back(uint8_t(gpu_profile_category_));
+}
+
+void D3D12CommandProcessor::GpuProfileBeginSubmission() {
+  if (!gpu_profile_enabled_) {
+    return;
+  }
+  // Wrap around well before the end; by then the low queries finished long ago.
+  if (gpu_profile_next_query_ > kGpuProfileQueries - (kGpuProfileQueries >> 2)) {
+    gpu_profile_next_query_ = 0;
+  }
+  gpu_profile_current_.submission = 0;
+  gpu_profile_current_.first_query = gpu_profile_next_query_;
+  gpu_profile_current_.categories.clear();
+  gpu_profile_submission_open_ = true;
+  deferred_command_list_.D3DEndQuery(gpu_profile_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     gpu_profile_current_.first_query);
+}
+
+void D3D12CommandProcessor::GpuProfileEndSubmission() {
+  if (!gpu_profile_enabled_ || !gpu_profile_submission_open_) {
+    return;
+  }
+  GpuProfileTimestamp();
+  gpu_profile_submission_open_ = false;
+  uint32_t query_count = uint32_t(gpu_profile_current_.categories.size()) + 1;
+  deferred_command_list_.D3DResolveQueryData(
+      gpu_profile_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpu_profile_current_.first_query,
+      query_count, gpu_profile_readback_.Get(), uint64_t(gpu_profile_current_.first_query) * 8);
+  gpu_profile_next_query_ = gpu_profile_current_.first_query + query_count;
+  gpu_profile_current_.submission = submission_current_;
+  gpu_profile_submitted_.push_back(std::move(gpu_profile_current_));
+  gpu_profile_current_ = GpuProfileSubmission();
+}
+
+void D3D12CommandProcessor::GpuProfileProcessCompleted() {
+  if (!gpu_profile_enabled_) {
+    return;
+  }
+  while (!gpu_profile_submitted_.empty() &&
+         gpu_profile_submitted_.front().submission <= submission_completed_) {
+    const GpuProfileSubmission& done = gpu_profile_submitted_.front();
+    const uint64_t* timestamps = gpu_profile_mapped_ + done.first_query;
+    for (size_t i = 0; i < done.categories.size(); ++i) {
+      if (timestamps[i + 1] >= timestamps[i]) {
+        gpu_profile_ms_[done.categories[i]] +=
+            double(timestamps[i + 1] - timestamps[i]) * 1000.0 / double(gpu_profile_frequency_);
+      }
+    }
+    gpu_profile_submitted_.pop_front();
+  }
+}
+
+void D3D12CommandProcessor::GpuProfileFrameEnd() {
+  if (!gpu_profile_enabled_) {
+    return;
+  }
+  ++gpu_profile_frames_;
+  uint64_t now = GetTickCount64();
+  if (now - gpu_profile_period_start_ms_ < 10000 || !gpu_profile_frames_) {
+    return;
+  }
+  double frames = double(gpu_profile_frames_);
+  double total = 0.0;
+  for (double ms : gpu_profile_ms_) {
+    total += ms;
+  }
+  auto per_frame = [&](GpuProfileCategory category) {
+    return gpu_profile_ms_[size_t(category)] / frames;
+  };
+  REXGPU_INFO(
+      "GPU time per frame ({} frames): draws {:.2f} ms, EDRAM transfers {:.2f} ms, texture "
+      "loads {:.2f} ms, resolves {:.2f} ms, swap {:.2f} ms, other {:.2f} ms, total {:.2f} ms",
+      gpu_profile_frames_, per_frame(GpuProfileCategory::kDraw),
+      per_frame(GpuProfileCategory::kTransfer), per_frame(GpuProfileCategory::kTextureLoad),
+      per_frame(GpuProfileCategory::kResolve), per_frame(GpuProfileCategory::kSwap),
+      per_frame(GpuProfileCategory::kOther), total / frames);
+  REXGPU_INFO("{}", render_target_cache_->TakeTransferStats(gpu_profile_frames_));
+  TextureCache::Stats texture_stats = texture_cache_->TakeStats();
+  double seconds = double(now - gpu_profile_period_start_ms_) / 1000.0;
+  REXGPU_INFO(
+      "textures per second: {:.1f} created ({:.1f} reusing a resource), {:.1f} destroyed, "
+      "{:.1f} loaded; cache {} MB",
+      texture_stats.created / seconds, texture_stats.reused / seconds,
+      texture_stats.destroyed / seconds,
+      texture_stats.loaded / seconds, texture_cache_->total_host_memory_usage() >> 20);
+  if (!texture_stats.created_kinds.empty()) {
+    std::vector<std::pair<std::string, uint32_t>> kinds(texture_stats.created_kinds.begin(),
+                                                        texture_stats.created_kinds.end());
+    std::sort(kinds.begin(), kinds.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string text = "most created textures:";
+    for (size_t i = 0; i < std::min(kinds.size(), size_t(8)); ++i) {
+      text += fmt::format(" [{}] x{};", kinds[i].first, kinds[i].second);
+    }
+    REXGPU_INFO("{}", text);
+  }
+  REXGPU_INFO("{}", shared_memory_->TakeStats(uint32_t(gpu_profile_frames_)));
+  REXGPU_INFO("draws writing stencil: {:.1f}/frame, bits ever written: 0x{:02X}",
+              double(gpu_profile_stencil_draws_) / frames, gpu_profile_stencil_mask_);
+  gpu_profile_stencil_draws_ = 0;
+  for (double& ms : gpu_profile_ms_) {
+    ms = 0.0;
+  }
+  gpu_profile_frames_ = 0;
+  gpu_profile_period_start_ms_ = now;
+}
+
+void D3D12CommandProcessor::LocateInvalidDeferredCommand() {
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  // A command list whose Close() failed stays in the error state even after Reset(), so every
+  // attempt uses a brand new allocator and list.
+  auto prefix_fails = [&](size_t command_count) -> bool {
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> list_1;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                              IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(),
+                                         nullptr, IID_PPV_ARGS(&list)))) {
+      return false;
+    }
+    list.As(&list_1);
+    deferred_command_list_.Execute(list.Get(), list_1.Get(), command_count);
+    return FAILED(list->Close());
+  };
+  size_t total = deferred_command_list_.GetCommandCount();
+  if (!prefix_fails(total)) {
+    REXGPU_ERROR("  invalid command not reproducible when re-recorded ({} commands)", total);
+    return;
+  }
+  size_t good = 0, bad = total;
+  while (bad - good > 1) {
+    size_t mid = good + (bad - good) / 2;
+    (prefix_fails(mid) ? bad : good) = mid;
+  }
+  REXGPU_ERROR("  first invalid command: #{} of {}: {}", bad - 1, total,
+               deferred_command_list_.DescribeCommand(bad - 1));
+  for (size_t i = bad > 6 ? bad - 6 : 0; i + 1 < bad; ++i) {
+    REXGPU_ERROR("    preceding #{}: {}", i, deferred_command_list_.DescribeCommand(i));
+  }
 }
 
 void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
@@ -3302,6 +3864,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    GpuProfileBeginSubmission();
 
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
@@ -3425,10 +3988,24 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         command_allocator_writable_first_->command_allocator;
     command_allocator->Reset();
     command_list_->Reset(command_allocator, nullptr);
+    GpuProfileEndSubmission();
+    provider.ProbeRecording("(before) recording guest submission");
     deferred_command_list_.Execute(command_list_, command_list_1_);
-    command_list_->Close();
+    // A failed Close() means a call recorded into the list was invalid; executing it removes
+    // the device with DXGI_ERROR_INVALID_CALL. Report it here, where it is still attributable.
+    HRESULT close_result = command_list_->Close();
+    if (FAILED(close_result)) {
+      static uint32_t close_failures = 0;
+      if (close_failures++ < 8) {
+        REXGPU_ERROR("D3D12 command list for submission {} failed to close: HRESULT 0x{:08X}",
+                     submission_current_, static_cast<unsigned>(close_result));
+        LocateInvalidDeferredCommand();
+      }
+    }
     ID3D12CommandList* execute_command_lists[] = {command_list_};
+    provider.ProbeRecording("(before) guest command list submission");
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    provider.ProbeRecording("guest command list submission");
     command_allocator_writable_first_->last_usage_submission = submission_current_;
     if (command_allocator_submitted_last_) {
       command_allocator_submitted_last_->next = command_allocator_writable_first_;

@@ -11,6 +11,9 @@
 
 #pragma once
 
+#include <cstdint>
+#include <functional>
+
 #include <rex/system/xtypes.h>
 
 namespace rex::system {
@@ -20,6 +23,11 @@ class IInputSystem {
   virtual ~IInputSystem() = default;
   virtual X_STATUS Setup() = 0;
   virtual void Shutdown() = 0;
+
+  /// Bit N set = guest user N has a controller (user 0: any device, including keyboard/mouse).
+  virtual uint32_t ConnectedUserMask() const { return 1; }
+  /// Called with the new mask whenever it changes (from the thread that polls input).
+  virtual void SetUsersChangedCallback(std::function<void(uint32_t)> callback) { (void)callback; }
 };
 
 }  // namespace rex::system

@@ -18,6 +18,8 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <map>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -104,6 +106,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   static DXGI_FORMAT GetDepthSRVDepthDXGIFormat(xenos::DepthRenderTargetFormat format);
   static DXGI_FORMAT GetDepthSRVStencilDXGIFormat(xenos::DepthRenderTargetFormat format);
 
+  // Diagnostics (d3d12_gpu_profile): render target ownership transfers since the last call,
+  // grouped by source -> destination render target kind, as text.
+  std::string TakeTransferStats(uint64_t frames);
+
  protected:
   uint32_t GetMaxRenderTargetWidth() const override { return D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION; }
   uint32_t GetMaxRenderTargetHeight() const override {
@@ -119,6 +125,14 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void RequestPixelShaderInterlockBarrier() override;
 
  private:
+  struct TransferStat {
+    uint64_t transfers = 0;
+    uint64_t pixels = 0;
+  };
+  // Key: source key bits (format/msaa/depth) << 32 | destination key bits.
+  std::map<uint64_t, TransferStat> transfer_stats_;
+  uint64_t transfer_stats_calls_ = 0;
+
   enum class EdramBufferModificationStatus {
     // The values are ordered by how strong the barrier conditions are.
     // No uncommitted ROV/UAV writes.

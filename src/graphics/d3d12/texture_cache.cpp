@@ -22,6 +22,8 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
+
+#include <fmt/format.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -647,6 +649,8 @@ bool D3D12TextureCache::Initialize() {
 
 void D3D12TextureCache::ClearCache() {
   TextureCache::ClearCache();
+  recycled_resources_.clear();
+  recycled_resources_size_ = 0;
 
   // Clear texture descriptor cache.
   srv_descriptor_cache_free_.clear();
@@ -1111,6 +1115,15 @@ bool D3D12TextureCache::ClampDrawResolutionScaleToMaxSupported(
   return !was_clamped;
 }
 
+std::string D3D12TextureCache::DescribeScaledResolveState() const {
+  size_t buffers = 0;
+  for (const auto& buffer : scaled_resolve_2gb_buffers_) {
+    buffers += buffer ? 1 : 0;
+  }
+  return fmt::format("scaled resolve: {} virtual buffers, {} heaps of {} MB", buffers,
+                     scaled_resolve_heap_count_, kScaledResolveHeapSize >> 20);
+}
+
 bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
                                                            uint32_t length_unscaled,
                                                            uint32_t length_scaled_alignment_log2) {
@@ -1132,6 +1145,21 @@ bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscal
       (uint64_t(start_unscaled + (length_unscaled - 1)) * draw_resolution_scale_area +
        length_scaled_alignment_bits) &
       ~length_scaled_alignment_bits;
+  // Rounding the last byte up to the alignment can point one block past the end of the scaled
+  // address space when the range touches the end of guest memory. That mapped tiles outside the
+  // virtual buffer (UpdateTileMappings -> device removed, DXGI_ERROR_INVALID_CALL) and indexed
+  // past scaled_resolve_heaps_.
+  uint64_t scaled_address_space_end =
+      uint64_t(SharedMemory::kBufferSize) * draw_resolution_scale_area;
+  if (last_scaled >= scaled_address_space_end) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXGPU_WARN("D3D12TextureCache: scaled resolve range end 0x{:X} clamped to 0x{:X}",
+                  last_scaled, scaled_address_space_end - 1);
+    }
+    last_scaled = scaled_address_space_end - 1;
+  }
 
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
@@ -1219,6 +1247,7 @@ bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscal
           scaled_resolve_2gb_buffers_[buffer_index]->resource(), 1, &region_start_coordinates,
           &region_size, scaled_resolve_heap.Get(), 1, &range_flags, &heap_range_start_offset,
           &range_tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+      provider.ProbeRecording("scaled resolve UpdateTileMappings");
     }
     command_processor_.NotifyQueueOperationsDoneDirectly();
   }
@@ -1243,6 +1272,10 @@ bool D3D12TextureCache::MakeScaledResolveRangeCurrent(uint32_t start_unscaled,
   uint64_t length_scaled =
       (uint64_t(length_unscaled) * draw_resolution_scale_area + length_scaled_alignment_bits) &
       ~length_scaled_alignment_bits;
+  uint64_t scaled_address_space_end =
+      uint64_t(SharedMemory::kBufferSize) * draw_resolution_scale_area;
+  // Same as in EnsureScaledResolveMemoryCommitted: don't let the alignment go past the end.
+  length_scaled = std::min(length_scaled, scaled_address_space_end - start_scaled);
   uint64_t last_scaled = start_scaled + (length_scaled - 1);
 
   // Get one or two buffers that can hold the whole range.
@@ -1427,6 +1460,45 @@ D3D12TextureCache::D3D12Texture::~D3D12Texture() {
   for (const auto& descriptor_pair : srv_descriptors_) {
     d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
   }
+  // Textures are only destroyed once the GPU is done with them.
+  d3d12_texture_cache.RecycleResource(std::move(resource_), resource_state_, GetHostMemoryUsage());
+}
+
+void D3D12TextureCache::RecycleResource(Microsoft::WRL::ComPtr<ID3D12Resource>&& resource,
+                                        D3D12_RESOURCE_STATES state, uint64_t size) {
+  if (!resource || size > kRecycledResourcesMaxSize) {
+    return;
+  }
+  D3D12_RESOURCE_DESC desc = resource->GetDesc();
+  recycled_resources_.push_back({std::move(resource), desc, state, size});
+  recycled_resources_size_ += size;
+  while (recycled_resources_size_ > kRecycledResourcesMaxSize) {
+    recycled_resources_size_ -= recycled_resources_.front().size;
+    recycled_resources_.pop_front();
+  }
+}
+
+bool D3D12TextureCache::TakeRecycledResource(const D3D12_RESOURCE_DESC& desc,
+                                             Microsoft::WRL::ComPtr<ID3D12Resource>& resource,
+                                             D3D12_RESOURCE_STATES& state) {
+  for (auto it = recycled_resources_.rbegin(); it != recycled_resources_.rend(); ++it) {
+    const D3D12_RESOURCE_DESC& other = it->desc;
+    if (other.Dimension != desc.Dimension || other.Width != desc.Width ||
+        other.Height != desc.Height || other.DepthOrArraySize != desc.DepthOrArraySize ||
+        other.MipLevels != desc.MipLevels || other.Format != desc.Format ||
+        other.Flags != desc.Flags || other.Layout != desc.Layout ||
+        other.SampleDesc.Count != desc.SampleDesc.Count ||
+        other.SampleDesc.Quality != desc.SampleDesc.Quality) {
+      continue;
+    }
+    resource = std::move(it->resource);
+    state = it->state;
+    CountReusedTexture();
+    recycled_resources_size_ -= it->size;
+    recycled_resources_.erase(std::next(it).base());
+    return true;
+  }
+  return false;
 }
 
 bool D3D12TextureCache::IsDecompressionNeeded(xenos::TextureFormat format, uint32_t width,
@@ -1549,7 +1621,8 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   // Assuming untiling will be the next operation.
   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
   Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+  if (!TakeRecycledResource(desc, resource, resource_state) &&
+      FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
                                              provider.GetHeapFlagCreateNotZeroed(), &desc,
                                              resource_state, nullptr, IID_PPV_ARGS(&resource)))) {
     return nullptr;
@@ -1995,6 +2068,14 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
   desc.Alignment = 0;
   desc.Width = key().GetWidth();
   desc.Height = key().GetHeight();
+  // The wrapper keeps the key (including scaled_resolve), so it's loaded at the draw resolution
+  // scale like the 3D texture itself: size it the same way. An unscaled resource here made the
+  // load's CopyTextureRegion overflow the texture with resolution scaling, which invalidated
+  // the whole command list and removed the device (DXGI_ERROR_INVALID_CALL).
+  if (key().scaled_resolve) {
+    desc.Width *= d3d12_cache.draw_resolution_scale_x();
+    desc.Height *= d3d12_cache.draw_resolution_scale_y();
+  }
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   desc.Format = d3d12_cache.GetDXGIResourceFormat(key());

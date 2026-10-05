@@ -14,7 +14,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -77,6 +79,25 @@ class TextureCache {
   virtual void ClearCache();
 
   virtual void CompletedSubmissionUpdated(uint64_t completed_submission_index);
+
+  // Diagnostics (d3d12_gpu_profile): textures created, destroyed and loaded since the last call.
+  struct Stats {
+    uint32_t created = 0;
+    uint32_t destroyed = 0;
+    uint32_t loaded = 0;
+    // Created with the host resource of a destroyed texture.
+    uint32_t reused = 0;
+    // Created textures by kind ("tiled 2D k_DXT1 256x256 @1A2"), only while collect_stats_ is set.
+    std::map<std::string, uint32_t> created_kinds;
+  };
+  void set_collect_stats(bool collect) { collect_stats_ = collect; }
+  Stats TakeStats() {
+    Stats stats = stats_;
+    stats_ = {};
+    return stats;
+  }
+  uint64_t total_host_memory_usage() const { return textures_total_host_memory_usage_; }
+
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
@@ -547,6 +568,8 @@ class TextureCache {
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t /*fetch_constant_mask*/) {}
 
+  void CountReusedTexture() { ++stats_.reused; }
+
  private:
   struct PendingTextureLoad {
     Texture* texture = nullptr;
@@ -606,6 +629,8 @@ class TextureCache {
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
+  Stats stats_;
+  bool collect_stats_ = false;
 
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;

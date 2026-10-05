@@ -38,6 +38,8 @@
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DECLARE(bool, d3d12_gpu_profile);
+
 REXCVAR_DEFINE_BOOL(native_stencil_value_output_d3d12_intel, false, "GPU/D3D12",
                     "Native stencil value output for Intel D3D12");
 
@@ -3793,6 +3795,45 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   return pipelines;
 }
 
+std::string D3D12RenderTargetCache::TakeTransferStats(uint64_t frames) {
+  if (!frames) {
+    frames = 1;
+  }
+  std::vector<std::pair<uint64_t, TransferStat>> sorted(transfer_stats_.begin(),
+                                                        transfer_stats_.end());
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) { return a.second.pixels > b.second.pixels; });
+  uint64_t total_transfers = 0, total_pixels = 0;
+  for (const auto& entry : sorted) {
+    total_transfers += entry.second.transfers;
+    total_pixels += entry.second.pixels;
+  }
+  auto describe = [](uint32_t key_bits) {
+    RenderTargetKey key;
+    key.key = key_bits;
+    if (key.IsEmpty()) {
+      return std::string("nada");
+    }
+    return fmt::format("{}{} fmt{} msaa{} pitch{}", uint32_t(key.is_depth) ? "depth" : "color",
+                       key.Is64bpp() ? "64" : "32", uint32_t(key.resource_format),
+                       1u << uint32_t(key.msaa_samples), uint32_t(key.pitch_tiles_at_32bpp));
+  };
+  std::string text = fmt::format(
+      "EDRAM transfers per frame: {:.1f} ({:.2f} Mpix, {:.1f} calls)",
+      double(total_transfers) / frames, double(total_pixels) / frames / 1e6,
+      double(transfer_stats_calls_) / frames);
+  for (size_t i = 0; i < std::min(sorted.size(), size_t(6)); ++i) {
+    text += fmt::format("\n    {} -> {}: {:.1f}/frame, {:.2f} Mpix/frame",
+                        describe(uint32_t(sorted[i].first >> 32)),
+                        describe(uint32_t(sorted[i].first)),
+                        double(sorted[i].second.transfers) / frames,
+                        double(sorted[i].second.pixels) / frames / 1e6);
+  }
+  transfer_stats_.clear();
+  transfer_stats_calls_ = 0;
+  return text;
+}
+
 void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
@@ -3804,6 +3845,36 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   ID3D12Device* device = provider.GetDevice();
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+
+  if (render_target_transfers && REXCVAR_GET(d3d12_gpu_profile)) {
+    ++transfer_stats_calls_;
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      const RenderTarget* dest_rt = render_targets[i];
+      if (!dest_rt) {
+        continue;
+      }
+      RenderTargetKey dest_key = dest_rt->key();
+      for (const Transfer& transfer : render_target_transfers[i]) {
+        Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+        uint32_t rectangle_count = transfer.GetRectangles(
+            dest_key.base_tiles, dest_key.pitch_tiles_at_32bpp, dest_key.msaa_samples,
+            dest_key.Is64bpp(), rectangles, resolve_clear_rectangle);
+        uint64_t pixels = 0;
+        for (uint32_t r = 0; r < rectangle_count; ++r) {
+          pixels += uint64_t(rectangles[r].width_pixels) * rectangles[r].height_pixels;
+        }
+        RenderTargetKey source_key = transfer.source ? transfer.source->key() : RenderTargetKey();
+        // Base and pitch don't matter for the grouping.
+        source_key.base_tiles = 0;
+        RenderTargetKey dest_group_key = dest_key;
+        dest_group_key.base_tiles = 0;
+        TransferStat& stat =
+            transfer_stats_[(uint64_t(source_key.key) << 32) | dest_group_key.key];
+        ++stat.transfers;
+        stat.pixels += pixels * draw_resolution_scale_x() * draw_resolution_scale_y();
+      }
+    }
+  }
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
   D3D12_RECT clear_rect;

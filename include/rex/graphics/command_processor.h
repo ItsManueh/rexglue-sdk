@@ -79,6 +79,8 @@ class CommandProcessor {
     kNone,
     kFxaa,
     kFxaaExtreme,
+    // Subpixel morphological antialiasing (SMAA 1x, high preset). D3D12 only; Vulkan uses FXAA.
+    kSmaa,
   };
 
   CommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);

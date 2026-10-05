@@ -43,6 +43,10 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
 
+REXCVAR_DEFINE_BOOL(xam_split_screen_profiles, false, "Kernel",
+                    "Sign in a local offline profile for users 2-4 while a controller is "
+                    "connected to their slot (split screen)");
+
 namespace rex::system {
 
 constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
@@ -65,8 +69,10 @@ KernelState::KernelState(Runtime* emulator)
   file_system_ = emulator->file_system();
 
   app_manager_ = std::make_unique<xam::AppManager>();
-  user_profile_ = std::make_unique<xam::UserProfile>();
-  user_profile_->set_kernel_state(this);
+  for (uint32_t i = 0; i < kMaxLocalUsers; ++i) {
+    user_profiles_[i] = std::make_unique<xam::UserProfile>(i);
+    user_profiles_[i]->set_kernel_state(this);
+  }
 
   auto user_data_root = emulator_->user_data_root();
   if (!user_data_root.empty()) {
@@ -1097,14 +1103,57 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     listener->EnqueueNotification(0x00000009, 1);
     listener->EnqueueNotification(0x00000009, 0);
     // XN_SYS_SIGNINCHANGED x2
-    listener->EnqueueNotification(0x0000000A, 1);
-    listener->EnqueueNotification(0x0000000A, 1);
+    listener->EnqueueNotification(0x0000000A, signed_in_user_mask());
+    listener->EnqueueNotification(0x0000000A, signed_in_user_mask());
     // XN_SYS_INPUTDEVICESCHANGED x2
     listener->EnqueueNotification(0x00000012, 0);
     listener->EnqueueNotification(0x00000012, 0);
     // XN_SYS_INPUTDEVICECONFIGCHANGED x2
     listener->EnqueueNotification(0x00000013, 0);
     listener->EnqueueNotification(0x00000013, 0);
+  }
+}
+
+bool KernelState::IsUserSignedIn(uint32_t user_index) const {
+  if (user_index == 0) {
+    return true;
+  }
+  if (user_index >= kMaxLocalUsers || !REXCVAR_GET(xam_split_screen_profiles)) {
+    return false;
+  }
+  return (input_user_mask_.load(std::memory_order_relaxed) >> user_index) & 1;
+}
+
+uint32_t KernelState::signed_in_user_mask() const {
+  uint32_t mask = 0;
+  for (uint32_t i = 0; i < kMaxLocalUsers; ++i) {
+    if (IsUserSignedIn(i)) {
+      mask |= 1u << i;
+    }
+  }
+  return mask;
+}
+
+uint32_t KernelState::UserIndexFromXuid(uint64_t xuid) const {
+  for (uint32_t i = 0; i < kMaxLocalUsers; ++i) {
+    if (user_profiles_[i]->xuid() == xuid && IsUserSignedIn(i)) {
+      return i;
+    }
+  }
+  return kMaxLocalUsers;
+}
+
+void KernelState::OnInputUsersChanged(uint32_t connected_mask) {
+  input_user_mask_.store(connected_mask, std::memory_order_relaxed);
+  // XN_SYS_INPUTDEVICESCHANGED: a controller was connected or removed.
+  BroadcastNotification(0x00000012, 0);
+  uint32_t signin_mask = signed_in_user_mask();
+  if (notified_signin_mask_.exchange(signin_mask) != signin_mask) {
+    REXSYS_INFO("Local users signed in: {}{}{}{}", (signin_mask & 1) ? "1 " : "",
+                (signin_mask & 2) ? "2 " : "", (signin_mask & 4) ? "3 " : "",
+                (signin_mask & 8) ? "4" : "");
+    // XN_SYS_SIGNINCHANGED: like a profile signing in or out with its controller on the console.
+    BroadcastNotification(0x0000000A, signin_mask);
   }
 }
 

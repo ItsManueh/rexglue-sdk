@@ -46,6 +46,30 @@ namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor : public CommandProcessor {
  public:
+  // GPU time profiling by kind of work (d3d12_gpu_profile), measured with timestamp queries.
+  enum class GpuProfileCategory : uint8_t {
+    kOther,
+    kDraw,
+    kTransfer,
+    kTextureLoad,
+    kResolve,
+    kSwap,
+    kCount,
+  };
+  class GpuProfileScope {
+   public:
+    GpuProfileScope(D3D12CommandProcessor& command_processor, GpuProfileCategory category)
+        : command_processor_(command_processor),
+          previous_(command_processor.gpu_profile_category_) {
+      command_processor_.SetGpuProfileCategory(category);
+    }
+    ~GpuProfileScope() { command_processor_.SetGpuProfileCategory(previous_); }
+
+   private:
+    D3D12CommandProcessor& command_processor_;
+    GpuProfileCategory previous_;
+  };
+
   explicit D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                  system::KernelState* kernel_state);
   ~D3D12CommandProcessor();
@@ -330,6 +354,36 @@ class D3D12CommandProcessor : public CommandProcessor {
     return submission_completed_ + 1 >= submission_current_;
   }
   void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
+  void LocateInvalidDeferredCommand();
+
+  void SetGpuProfileCategory(GpuProfileCategory category);
+  void GpuProfileTimestamp();
+  void GpuProfileBeginSubmission();
+  void GpuProfileEndSubmission();
+  void GpuProfileProcessCompleted();
+  void GpuProfileFrameEnd();
+  static constexpr uint32_t kGpuProfileQueries = UINT32_C(1) << 17;
+  bool gpu_profile_enabled_ = false;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_profile_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_profile_readback_;
+  const uint64_t* gpu_profile_mapped_ = nullptr;
+  uint64_t gpu_profile_frequency_ = 0;
+  uint32_t gpu_profile_next_query_ = 0;
+  GpuProfileCategory gpu_profile_category_ = GpuProfileCategory::kOther;
+  struct GpuProfileSubmission {
+    uint64_t submission = 0;
+    uint32_t first_query = 0;
+    // categories[i]: kind of work between timestamps first_query + i and first_query + i + 1.
+    std::vector<uint8_t> categories;
+  };
+  bool gpu_profile_submission_open_ = false;
+  GpuProfileSubmission gpu_profile_current_;
+  std::deque<GpuProfileSubmission> gpu_profile_submitted_;
+  double gpu_profile_ms_[size_t(GpuProfileCategory::kCount)] = {};
+  uint64_t gpu_profile_frames_ = 0;
+  uint64_t gpu_profile_period_start_ms_ = 0;
+  uint64_t gpu_profile_stencil_draws_ = 0;
+  uint32_t gpu_profile_stencil_mask_ = 0;
 
   void UpdateDebugMarkersEnabled();
   void PushDebugMarker(const char* format, ...);
@@ -596,6 +650,33 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12RootSignature> fxaa_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_extreme_pipeline_;
+
+  // SMAA 1x swap post effect: edge detection, blending weights, neighborhood blending.
+  struct SmaaConstants {
+    float rt_metrics[4];
+    uint32_t size[2];
+  };
+  enum class SmaaRootParameter : UINT {
+    kConstants,
+    kDestination,
+    kSource0,
+    kSource1,
+    kSource2,
+    kCount,
+  };
+  // Creates (or resizes) the SMAA work textures and uploads the lookup textures, recording any
+  // upload into the current submission. Returns false if SMAA can't be used this frame.
+  bool PrepareSmaaResources(uint32_t width, uint32_t height);
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> smaa_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> smaa_pipelines_[3];
+  // R8G8 edges and R8G8B8A8 blending weights, sized like the guest output, and the constant
+  // area (R8G8 160x560) and search (R8 64x16) lookup textures. All kept in
+  // NON_PIXEL_SHADER_RESOURCE state between uses.
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_edges_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_weights_texture_;
+  uint64_t smaa_work_textures_submission_ = 0;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_area_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_search_texture_;
 
   struct ResolveDownscaleConstants {
     uint32_t scale_x;

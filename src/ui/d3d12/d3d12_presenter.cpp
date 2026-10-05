@@ -33,6 +33,10 @@
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
 
+REXCVAR_DEFINE_BOOL(present_vsync, false, "UI/D3D12",
+                    "Wait for the display refresh when presenting (sync interval 1, no tearing)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::ui::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -296,6 +300,7 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
     }
     ID3D12CommandList* execute_command_list = command_list.Get();
     direct_queue->ExecuteCommandLists(1, &execute_command_list);
+    provider_.ProbeRecording("presenter guest output capture");
     if (!submission_tracker.NextSubmission()) {
       REXLOG_ERROR("D3D12Presenter: Failed to signal the guest output capturing fence");
       return false;
@@ -1140,9 +1145,17 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   command_list->ResourceBarrier(1, &barrier_rtv_to_present);
 
   // Execute and present.
-  command_list->Close();
+  HRESULT close_result = command_list->Close();
+  if (FAILED(close_result)) {
+    static uint32_t close_failures = 0;
+    if (close_failures++ < 8) {
+      REXLOG_ERROR("D3D12Presenter: paint command list failed to close: HRESULT 0x{:08X}",
+                   static_cast<unsigned>(close_result));
+    }
+  }
   ID3D12CommandList* execute_command_list = command_list;
   provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
+  provider_.ProbeRecording("presenter paint (guest output + UI)");
   if (execute_ui_drawers) {
     ui_submission_tracker_.NextSubmission();
   }
@@ -1155,9 +1168,15 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
+  // With present_vsync the frame waits for the display refresh instead; tearing must not be
+  // requested with a non-zero sync interval.
+  const bool present_vsync = REXCVAR_GET(present_vsync);
   HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+      present_vsync ? 1 : 0,
+      DXGI_PRESENT_RESTART |
+          (paint_context_.swap_chain_allows_tearing && !present_vsync ? DXGI_PRESENT_ALLOW_TEARING
+                                                                      : 0));
+  provider_.ProbeRecording("swap chain Present");
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.

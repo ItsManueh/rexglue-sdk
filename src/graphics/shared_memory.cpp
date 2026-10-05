@@ -13,6 +13,8 @@
 #include <cstring>
 #include <utility>
 
+#include <fmt/format.h>
+
 #include <rex/assert.h>
 #include <rex/bit.h>
 #include <rex/dbg.h>
@@ -343,8 +345,8 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
-  merged_ranges.reserve(count);
+  std::vector<std::pair<uint32_t, uint32_t>>& merged_ranges = merged_ranges_;
+  merged_ranges.clear();
   for (size_t i = 0; i < count; ++i) {
     uint32_t start = ranges[i].first;
     uint32_t length = ranges[i].second;
@@ -468,6 +470,34 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   return UploadRanges(upload_ranges_);
 }
 
+std::string SharedMemory::TakeStats(uint32_t frames) {
+  constexpr double kMB = 1024.0 * 1024.0;
+  double per_frame = 1.0 / std::max(frames, uint32_t(1));
+  auto describe = [&](const char* what, PerMegabyte& bytes) {
+    std::array<uint32_t, (kBufferSize >> 20)> order;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < order.size(); ++i) {
+      order[i] = i;
+      total += bytes[i];
+    }
+    std::partial_sort(order.begin(), order.begin() + 5, order.end(),
+                      [&](uint32_t a, uint32_t b) { return bytes[a] > bytes[b]; });
+    std::string text = fmt::format("{} {:.2f} MB/frame (", what, double(total) / kMB * per_frame);
+    for (uint32_t i = 0; i < 5 && bytes[order[i]]; ++i) {
+      text += fmt::format("{}{:08X} {:.2f}", i ? ", " : "", order[i] << 20,
+                          double(bytes[order[i]]) / kMB * per_frame);
+    }
+    bytes.fill(0);
+    return text + ")";
+  };
+  std::string text = describe("memory uploaded", stat_uploaded_) + "; " +
+                     describe("invalidated by the CPU", stat_invalidated_) +
+                     fmt::format(" in {:.0f} notifications/frame",
+                                 double(stat_invalidations_) * per_frame);
+  stat_invalidations_ = 0;
+  return text;
+}
+
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   std::pair<uint32_t, uint32_t> range(start, length);
   return RequestRanges(&range, 1);
@@ -515,6 +545,10 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
           (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
     }
   }
+
+  ++stat_invalidations_;
+  stat_invalidated_[(page_first << page_size_log2_) >> 20] +=
+      uint64_t(page_last - page_first + 1) << page_size_log2_;
 
   for (uint32_t i = block_first; i <= block_last; ++i) {
     uint64_t invalidate_bits = UINT64_MAX;

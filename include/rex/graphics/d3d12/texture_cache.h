@@ -12,6 +12,8 @@
 #pragma once
 
 #include <array>
+#include <deque>
+#include <string>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -120,6 +122,8 @@ class D3D12TextureCache final : public TextureCache {
   static bool ClampDrawResolutionScaleToMaxSupported(uint32_t& scale_x, uint32_t& scale_y,
                                                      const ui::d3d12::D3D12Provider& provider);
   // Ensures the tiles backing the range in the buffers are allocated.
+  // Diagnostics: scaled resolve buffers / heaps currently allocated.
+  std::string DescribeScaledResolveState() const;
   bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
                                           uint32_t length_scaled_alignment_log2 = 0) override;
   // Makes the specified range of up to 1-2 GB currently accessible on the GPU.
@@ -403,6 +407,15 @@ class D3D12TextureCache final : public TextureCache {
   uint32_t FindOrCreateTextureDescriptor(D3D12Texture& texture, xenos::DataDimension dimension,
                                          bool is_signed, uint32_t host_swizzle);
   void ReleaseTextureDescriptor(uint32_t descriptor_index);
+
+  // Resources of destroyed textures are kept for new textures with the same description instead
+  // of being released: drivers are slow at creating and destroying committed resources, and
+  // texture streaming keeps replacing textures with others of the same size and format.
+  void RecycleResource(Microsoft::WRL::ComPtr<ID3D12Resource>&& resource,
+                       D3D12_RESOURCE_STATES state, uint64_t size);
+  bool TakeRecycledResource(const D3D12_RESOURCE_DESC& desc,
+                            Microsoft::WRL::ComPtr<ID3D12Resource>& resource,
+                            D3D12_RESOURCE_STATES& state);
   D3D12_CPU_DESCRIPTOR_HANDLE GetTextureDescriptorCPUHandle(uint32_t descriptor_index) const;
 
   size_t GetScaledResolveBufferCount() const {
@@ -466,6 +479,17 @@ class D3D12TextureCache final : public TextureCache {
   uint32_t srv_descriptor_cache_allocated_;
   // Indices of cached descriptors used by deleted textures, for reuse.
   std::vector<uint32_t> srv_descriptor_cache_free_;
+
+  struct RecycledResource {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    D3D12_RESOURCE_DESC desc;
+    D3D12_RESOURCE_STATES state;
+    uint64_t size;
+  };
+  static constexpr uint64_t kRecycledResourcesMaxSize = uint64_t(192) << 20;
+  // Oldest first.
+  std::deque<RecycledResource> recycled_resources_;
+  uint64_t recycled_resources_size_ = 0;
 
   enum class NullSRVDescriptorIndex {
     k2DArray,

@@ -214,10 +214,13 @@ class UserProfile {
     }
   };
 
-  UserProfile();
+  /// user_index 0 is the main profile; 1-3 are the local split screen profiles.
+  explicit UserProfile(uint32_t user_index = 0);
 
+  uint32_t user_index() const { return user_index_; }
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
+  void set_name(std::string name) { name_ = std::move(name); }
   uint32_t signin_state() const { return 1; }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
@@ -227,6 +230,7 @@ class UserProfile {
   Setting* GetSetting(uint32_t setting_id);
 
  private:
+  uint32_t user_index_ = 0;
   uint64_t xuid_;
   std::string name_;
   std::vector<std::unique_ptr<Setting>> setting_list_;
