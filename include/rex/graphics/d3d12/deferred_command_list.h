@@ -34,6 +34,9 @@ class DeferredCommandList {
                       size_t initial_size_bytes = 1_MiB);
 
   void Reset();
+  // Exchanges the recorded commands with another list (the asynchronous submission thread takes the
+  // commands of a submission and leaves the storage of an executed one to record into).
+  void SwapCommands(DeferredCommandList& other) { command_stream_.swap(other.command_stream_); }
   // command_limit: record only the first N commands (used to locate an invalid call).
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1,
                size_t command_limit = SIZE_MAX);

@@ -14,8 +14,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -100,6 +102,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   void NotifyQueueOperationsDoneDirectly() {
     queue_operations_done_since_submission_signal_ = true;
   }
+
+  // With asynchronous submission, waits until every ended submission has been executed on the
+  // queue. Needed before doing anything on the queue directly (like UpdateTileMappings) that must
+  // come after the submissions already ended.
+  void AwaitSubmissionThread();
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
   uint64_t GetCompletedFrame() const { return frame_completed_; }
@@ -357,7 +364,15 @@ class D3D12CommandProcessor : public CommandProcessor {
     return submission_completed_ + 1 >= submission_current_;
   }
   void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
-  void LocateInvalidDeferredCommand();
+  void LocateInvalidDeferredCommand(DeferredCommandList& commands);
+
+  // Replays the commands into the Direct3D 12 command list, executes it and signals the submission
+  // fence with the submission number. On the command processor thread, or on the submission thread
+  // with d3d12_async_submission.
+  void ExecuteSubmission(DeferredCommandList& commands, ID3D12CommandAllocator* command_allocator,
+                         uint64_t submission);
+  void SubmissionThreadMain();
+  void ShutdownSubmissionThread();
 
   void SetGpuProfileCategory(GpuProfileCategory category);
   void GpuProfileTimestamp();
@@ -517,6 +532,31 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+
+  // Asynchronous submission (d3d12_async_submission): replaying the deferred command list into the
+  // Direct3D 12 command list and executing it is mostly driver work, about a fifth of this thread
+  // in split screen. EndSubmission hands the recorded commands to a thread of its own instead, and
+  // long command buffers are split every d3d12_async_submission_draws draws, so the driver works
+  // on one part of the frame while the next is being emulated.
+  struct PendingSubmission {
+    std::unique_ptr<DeferredCommandList> commands;
+    ID3D12CommandAllocator* command_allocator = nullptr;
+    uint64_t submission = 0;
+  };
+  bool async_submission_ = false;
+  uint32_t async_submission_draws_ = 0;
+  uint32_t draws_in_submission_ = 0;
+  std::unique_ptr<rex::thread::Thread> submission_thread_;
+  std::mutex submission_mutex_;
+  // Signaled when a submission is queued or on shutdown.
+  std::condition_variable submission_queued_;
+  // Signaled when the queue becomes empty and nothing is being executed.
+  std::condition_variable submission_idle_;
+  std::deque<PendingSubmission> submission_queue_;
+  // Executed command lists whose storage is reused for recording.
+  std::vector<std::unique_ptr<DeferredCommandList>> free_deferred_command_lists_;
+  bool submission_thread_executing_ = false;
+  bool submission_thread_shutdown_ = false;
 
   bool debug_markers_enabled_ = false;
 

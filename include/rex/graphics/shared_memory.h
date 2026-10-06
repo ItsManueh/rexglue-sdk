@@ -152,6 +152,10 @@ class SharedMemory {
   PerMegabyte stat_uploaded_{};
   PerMegabyte stat_invalidated_{};
   uint64_t stat_invalidations_ = 0;
+  // Upload operations (each makes its pages valid and write-protects them again) and requests
+  // that had to take the slow path.
+  uint64_t stat_upload_operations_ = 0;
+  uint64_t stat_slow_requests_ = 0;
 
  private:
   memory::Memory& memory_;

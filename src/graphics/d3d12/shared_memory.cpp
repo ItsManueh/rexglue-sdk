@@ -272,6 +272,8 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
+  // The tile mapping is a queue operation: after the submissions already ended.
+  command_processor_.AwaitSubmissionThread();
 
   D3D12_HEAP_DESC heap_desc = {};
   heap_desc.SizeInBytes = length_bytes;
@@ -309,35 +311,52 @@ bool D3D12SharedMemory::UploadRanges(
   }
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
-  auto& command_list = command_processor_.GetDeferredCommandList();
-  for (auto upload_range : upload_page_ranges) {
-    uint32_t upload_range_start = upload_range.first;
-    uint32_t upload_range_length = upload_range.second;
-    while (upload_range_length != 0) {
-      ID3D12Resource* upload_buffer;
-      size_t upload_buffer_offset, upload_buffer_size;
-      uint8_t* upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
-          command_processor_.GetCurrentSubmission(), upload_range_length << page_size_log2(),
-          size_t(1) << page_size_log2(), &upload_buffer, &upload_buffer_offset, &upload_buffer_size,
-          nullptr);
-      if (upload_buffer_mapping == nullptr) {
-        REXGPU_ERROR("Shared memory: Failed to get an upload buffer");
-        return false;
+  // First every range is made valid and write-protected, under a single acquisition of the lock
+  // shared with the guest threads (MakeRangeValid and the memory protection take it again, which
+  // then never waits): that lock is also taken by guest threads for every kernel object wait, and
+  // waiting for it several times per upload cost the command processor a tenth of its time in
+  // split screen. The copies come after releasing it; the protection is already in place, so a
+  // write made during a copy still invalidates the pages.
+  upload_copies_.clear();
+  bool succeeded = true;
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    for (auto upload_range : upload_page_ranges) {
+      uint32_t upload_range_start = upload_range.first;
+      uint32_t upload_range_length = upload_range.second;
+      while (upload_range_length != 0) {
+        UploadCopy copy;
+        copy.mapping = upload_buffer_pool_->RequestPartial(
+            command_processor_.GetCurrentSubmission(), upload_range_length << page_size_log2(),
+            size_t(1) << page_size_log2(), &copy.buffer, &copy.buffer_offset, &copy.size,
+            nullptr);
+        if (copy.mapping == nullptr) {
+          REXGPU_ERROR("Shared memory: Failed to get an upload buffer");
+          succeeded = false;
+          break;
+        }
+        copy.start = upload_range_start << page_size_log2();
+        MakeRangeValid(copy.start, uint32_t(copy.size), false);
+        ++stat_upload_operations_;
+        upload_copies_.push_back(copy);
+        uint32_t upload_buffer_pages = uint32_t(copy.size >> page_size_log2());
+        upload_range_start += upload_buffer_pages;
+        upload_range_length -= upload_buffer_pages;
       }
-      MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
-      stat_uploaded_[(upload_range_start << page_size_log2()) >> 20] += upload_buffer_size;
-      command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
-                                       upload_buffer, UINT64(upload_buffer_offset),
-                                       UINT64(upload_buffer_size));
-      uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
-      upload_range_start += upload_buffer_pages;
-      upload_range_length -= upload_buffer_pages;
+      if (!succeeded) {
+        break;
+      }
     }
   }
-  return true;
+  // Even after a failure, the ranges already made valid must get their data.
+  auto& command_list = command_processor_.GetDeferredCommandList();
+  for (const UploadCopy& copy : upload_copies_) {
+    std::memcpy(copy.mapping, memory().TranslatePhysical(copy.start), copy.size);
+    stat_uploaded_[copy.start >> 20] += copy.size;
+    command_list.D3DCopyBufferRegion(buffer_, copy.start, copy.buffer, UINT64(copy.buffer_offset),
+                                     UINT64(copy.size));
+  }
+  return succeeded;
 }
 
 }  // namespace rex::graphics::d3d12

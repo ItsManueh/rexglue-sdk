@@ -58,6 +58,23 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Off by default: on a 6-core CPU without SMT the guest threads that wait for the GPU spin and keep
+// every core busy, so the extra thread competed with them (split screen: 40-54 FPS with it, a
+// steady 48-49 without). It is meant for CPUs with cores to spare.
+REXCVAR_DEFINE_BOOL(d3d12_async_submission, false, "GPU/D3D12",
+                    "Execute Direct3D 12 command lists on a thread of their own, in parallel with "
+                    "the processing of the next guest GPU commands (for CPUs with 8 or more "
+                    "hardware threads)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(d3d12_async_submission_draws, 1000, "GPU/D3D12",
+                     "With asynchronous submission, draws after which a long command buffer is "
+                     "split into another submission, so its execution can start earlier")
+    .range(100, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DECLARE(int32_t, gpu_command_thread_priority);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -946,6 +963,22 @@ bool D3D12CommandProcessor::SetupContext() {
   // Optional - added in Creators Update (SDK 10.0.15063.0).
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
 
+  if (REXCVAR_GET(d3d12_async_submission)) {
+    async_submission_draws_ = uint32_t(REXCVAR_GET(d3d12_async_submission_draws));
+    submission_thread_shutdown_ = false;
+    submission_thread_ = rex::thread::Thread::Create({}, [this]() { SubmissionThreadMain(); });
+    if (submission_thread_) {
+      submission_thread_->set_name("GPU Submission");
+      // As urgent as the thread that records the commands.
+      if (int32_t priority = REXCVAR_GET(gpu_command_thread_priority); priority > 0) {
+        submission_thread_->set_priority(priority);
+      }
+      async_submission_ = true;
+    } else {
+      REXGPU_WARN("Failed to create the submission thread, submitting synchronously");
+    }
+  }
+
   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
 
@@ -1740,6 +1773,7 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  ShutdownSubmissionThread();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2604,6 +2638,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // queue.
         SubmitBarriers();
         EndSubmission(true);
+        AwaitSubmissionThread();
         return true;
       });
 
@@ -2684,9 +2719,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+  // With asynchronous submission, a long command buffer is split so the submission thread can
+  // execute its first part while the rest is processed. Not inside an occlusion query, which must
+  // begin and end in the same command list.
+  if (async_submission_ && submission_open_ && draws_in_submission_ >= async_submission_draws_ &&
+      !active_occlusion_query_.valid) {
+    EndSubmission(false);
+  }
+
   if (!BeginSubmission(true)) {
     return false;
   }
+  ++draws_in_submission_;
 
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
@@ -3501,6 +3545,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     // submission, but just in case of a failure, or queue operations being done
     // outside of a submission, await explicitly.
     if (queue_operations_done_since_submission_signal_) {
+      AwaitSubmissionThread();
       UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
       ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
       if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value) &&
@@ -3715,7 +3760,7 @@ void D3D12CommandProcessor::GpuProfileFrameEnd() {
   gpu_profile_period_start_ms_ = now;
 }
 
-void D3D12CommandProcessor::LocateInvalidDeferredCommand() {
+void D3D12CommandProcessor::LocateInvalidDeferredCommand(DeferredCommandList& commands) {
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   // A command list whose Close() failed stays in the error state even after Reset(), so every
   // attempt uses a brand new allocator and list.
@@ -3730,10 +3775,10 @@ void D3D12CommandProcessor::LocateInvalidDeferredCommand() {
       return false;
     }
     list.As(&list_1);
-    deferred_command_list_.Execute(list.Get(), list_1.Get(), command_count);
+    commands.Execute(list.Get(), list_1.Get(), command_count);
     return FAILED(list->Close());
   };
-  size_t total = deferred_command_list_.GetCommandCount();
+  size_t total = commands.GetCommandCount();
   if (!prefix_fails(total)) {
     REXGPU_ERROR("  invalid command not reproducible when re-recorded ({} commands)", total);
     return;
@@ -3744,9 +3789,9 @@ void D3D12CommandProcessor::LocateInvalidDeferredCommand() {
     (prefix_fails(mid) ? bad : good) = mid;
   }
   REXGPU_ERROR("  first invalid command: #{} of {}: {}", bad - 1, total,
-               deferred_command_list_.DescribeCommand(bad - 1));
+               commands.DescribeCommand(bad - 1));
   for (size_t i = bad > 6 ? bad - 6 : 0; i + 1 < bad; ++i) {
-    REXGPU_ERROR("    preceding #{}: {}", i, deferred_command_list_.DescribeCommand(i));
+    REXGPU_ERROR("    preceding #{}: {}", i, commands.DescribeCommand(i));
   }
 }
 
@@ -3853,6 +3898,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (!submission_open_) {
     submission_open_ = true;
+    draws_in_submission_ = 0;
 
     // Start a new deferred command list - will submit it to the real one in the
     // end of the submission (when async pipeline creation requests are
@@ -3928,6 +3974,85 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   return true;
 }
 
+void D3D12CommandProcessor::ExecuteSubmission(DeferredCommandList& commands,
+                                              ID3D12CommandAllocator* command_allocator,
+                                              uint64_t submission) {
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  command_allocator->Reset();
+  command_list_->Reset(command_allocator, nullptr);
+  provider.ProbeRecording("(before) recording guest submission");
+  commands.Execute(command_list_, command_list_1_);
+  // A failed Close() means a call recorded into the list was invalid; executing it removes
+  // the device with DXGI_ERROR_INVALID_CALL. Report it here, where it is still attributable.
+  HRESULT close_result = command_list_->Close();
+  if (FAILED(close_result)) {
+    static uint32_t close_failures = 0;
+    if (close_failures++ < 8) {
+      REXGPU_ERROR("D3D12 command list for submission {} failed to close: HRESULT 0x{:08X}",
+                   submission, static_cast<unsigned>(close_result));
+      LocateInvalidDeferredCommand(commands);
+    }
+  }
+  ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
+  ID3D12CommandList* execute_command_lists[] = {command_list_};
+  provider.ProbeRecording("(before) guest command list submission");
+  direct_queue->ExecuteCommandLists(1, execute_command_lists);
+  provider.ProbeRecording("guest command list submission");
+  direct_queue->Signal(submission_fence_, submission);
+}
+
+void D3D12CommandProcessor::SubmissionThreadMain() {
+  while (true) {
+    PendingSubmission pending;
+    {
+      std::unique_lock<std::mutex> lock(submission_mutex_);
+      submission_queued_.wait(
+          lock, [this] { return submission_thread_shutdown_ || !submission_queue_.empty(); });
+      if (submission_queue_.empty()) {
+        // Shutting down with everything executed.
+        break;
+      }
+      pending = std::move(submission_queue_.front());
+      submission_queue_.pop_front();
+      submission_thread_executing_ = true;
+    }
+    ExecuteSubmission(*pending.commands, pending.command_allocator, pending.submission);
+    pending.commands->Reset();
+    {
+      std::lock_guard<std::mutex> lock(submission_mutex_);
+      free_deferred_command_lists_.push_back(std::move(pending.commands));
+      submission_thread_executing_ = false;
+      if (submission_queue_.empty()) {
+        submission_idle_.notify_all();
+      }
+    }
+  }
+}
+
+void D3D12CommandProcessor::AwaitSubmissionThread() {
+  if (!async_submission_) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(submission_mutex_);
+  submission_idle_.wait(
+      lock, [this] { return submission_queue_.empty() && !submission_thread_executing_; });
+}
+
+void D3D12CommandProcessor::ShutdownSubmissionThread() {
+  if (!submission_thread_) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(submission_mutex_);
+    submission_thread_shutdown_ = true;
+  }
+  submission_queued_.notify_one();
+  rex::thread::Wait(submission_thread_.get(), false);
+  submission_thread_.reset();
+  async_submission_ = false;
+  free_deferred_command_lists_.clear();
+}
+
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
 
@@ -3971,8 +4096,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // destroyed between frames.
     SubmitBarriers();
 
-    ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
-
     // Submit the deferred command list.
     // Only one deferred command list must be executed in the same
     // ExecuteCommandLists - the boundaries of ExecuteCommandLists are a full
@@ -3980,26 +4103,33 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // happens between Xenia submissions.
     ID3D12CommandAllocator* command_allocator =
         command_allocator_writable_first_->command_allocator;
-    command_allocator->Reset();
-    command_list_->Reset(command_allocator, nullptr);
     GpuProfileEndSubmission();
-    provider.ProbeRecording("(before) recording guest submission");
-    deferred_command_list_.Execute(command_list_, command_list_1_);
-    // A failed Close() means a call recorded into the list was invalid; executing it removes
-    // the device with DXGI_ERROR_INVALID_CALL. Report it here, where it is still attributable.
-    HRESULT close_result = command_list_->Close();
-    if (FAILED(close_result)) {
-      static uint32_t close_failures = 0;
-      if (close_failures++ < 8) {
-        REXGPU_ERROR("D3D12 command list for submission {} failed to close: HRESULT 0x{:08X}",
-                     submission_current_, static_cast<unsigned>(close_result));
-        LocateInvalidDeferredCommand();
+    if (async_submission_) {
+      std::unique_ptr<DeferredCommandList> commands;
+      {
+        std::lock_guard<std::mutex> lock(submission_mutex_);
+        if (!free_deferred_command_lists_.empty()) {
+          commands = std::move(free_deferred_command_lists_.back());
+          free_deferred_command_lists_.pop_back();
+        }
       }
+      if (!commands) {
+        commands = std::make_unique<DeferredCommandList>(*this);
+      }
+      // The submission thread takes the recorded commands, and the next submission is recorded
+      // into the storage of an executed one. Everything the commands reference stays alive until
+      // the submission fence passes this submission, which the submission thread signals only
+      // after executing it.
+      commands->SwapCommands(deferred_command_list_);
+      {
+        std::lock_guard<std::mutex> lock(submission_mutex_);
+        submission_queue_.push_back(
+            PendingSubmission{std::move(commands), command_allocator, submission_current_});
+      }
+      submission_queued_.notify_one();
+    } else {
+      ExecuteSubmission(deferred_command_list_, command_allocator, submission_current_);
     }
-    ID3D12CommandList* execute_command_lists[] = {command_list_};
-    provider.ProbeRecording("(before) guest command list submission");
-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
-    provider.ProbeRecording("guest command list submission");
     command_allocator_writable_first_->last_usage_submission = submission_current_;
     if (command_allocator_submitted_last_) {
       command_allocator_submitted_last_->next = command_allocator_writable_first_;
@@ -4013,7 +4143,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       command_allocator_writable_last_ = nullptr;
     }
 
-    direct_queue->Signal(submission_fence_, submission_current_++);
+    ++submission_current_;
 
     submission_open_ = false;
 

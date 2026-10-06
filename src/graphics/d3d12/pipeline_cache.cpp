@@ -59,6 +59,18 @@ REXCVAR_DEFINE_BOOL(d3d12_await_pipelines_at_submission, false, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm_dxilconv, false, "GPU/D3D12",
                     "Dump DXIL conversion disassembly");
 
+// Creating every pipeline of the storage before the game starts takes 2-3 seconds with the
+// driver's own shader cache, and over a minute without it (after a driver update or clearing its
+// cache), with the window black all the while. Created in the background instead, by the creation
+// threads whenever the game has no pipeline waiting, the game starts at once; a stored pipeline
+// that a draw needs before its turn is moved ahead of the others. (At a lower thread priority they
+// never got their turn: the guest threads that wait for the GPU spin on every core.)
+REXCVAR_DEFINE_BOOL(d3d12_background_storage_pipelines, true, "GPU/D3D12",
+                    "Create the pipelines saved by previous runs in the background instead of "
+                    "before the game starts (needs asynchronous shader compilation and pipeline "
+                    "creation threads)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
                      "Number of pipeline creation threads (-1 for auto)")
     .range(-1, 32)
@@ -188,6 +200,7 @@ void PipelineCache::Shutdown() {
     creation_threads_.clear();
   }
   creation_completion_event_.reset();
+  background_creation_queue_.clear();
 
   // Shut down the persistent shader / pipeline storage.
   ShutdownShaderStorage();
@@ -537,7 +550,13 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     size_t creation_thread_needed_count =
         std::max(std::min(pipeline_stored_descriptions.size(), logical_processor_count) - size_t(1),
                  creation_thread_original_count);
-    while (creation_threads_.size() < creation_thread_original_count) {
+    const bool background = REXCVAR_GET(d3d12_background_storage_pipelines) &&
+                            REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty();
+    if (background) {
+      // Only the threads that stay: extra ones would be shut down right after queuing.
+      creation_thread_needed_count = creation_thread_original_count;
+    }
+    while (creation_threads_.size() < creation_thread_needed_count) {
       size_t creation_thread_index = creation_threads_.size();
       std::unique_ptr<rex::thread::Thread> creation_thread = rex::thread::Thread::Create(
           {}, [this, creation_thread_index]() { CreationThread(creation_thread_index); });
@@ -641,7 +660,11 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           bound_rts, shader_writes_color_targets, shader_writes_depth);
       pipelines_.emplace(pipeline_stored_description.description_hash, new_pipeline);
       COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
-      if (!creation_threads_.empty()) {
+      if (background) {
+        new_pipeline->background.store(kBackgroundWaiting, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(creation_request_lock_);
+        background_creation_queue_.push_back(new_pipeline);
+      } else if (!creation_threads_.empty()) {
         // Submit the pipeline for creation to any available thread.
         {
           std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -655,7 +678,17 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       ++pipelines_created;
     }
 
-    if (!creation_threads_.empty()) {
+    if (background) {
+      {
+        std::lock_guard<std::mutex> lock(creation_request_lock_);
+        background_creation_total_ = background_creation_queue_.size();
+        background_creation_done_ = 0;
+        background_creation_start_ = rex::chrono::Clock::QueryHostTickCount();
+      }
+      creation_request_cond_.notify_all();
+      REXGPU_INFO("Creating {} graphics pipelines from the storage in the background",
+                  pipelines_created);
+    } else if (!creation_threads_.empty()) {
       CreateQueuedPipelinesOnProcessorThread();
       if (creation_threads_.size() > creation_thread_original_count) {
         {
@@ -690,12 +723,14 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
     }
 
-    REXGPU_INFO(
-        "Created {} graphics pipelines (not including reading the "
-        "descriptions) from the storage in {} milliseconds",
-        pipelines_created,
-        (rex::chrono::Clock::QueryHostTickCount() - pipeline_creation_start_) * 1000 /
-            rex::chrono::Clock::QueryHostTickFrequency());
+    if (!background) {
+      REXGPU_INFO(
+          "Created {} graphics pipelines (not including reading the "
+          "descriptions) from the storage in {} milliseconds",
+          pipelines_created,
+          (rex::chrono::Clock::QueryHostTickCount() - pipeline_creation_start_) * 1000 /
+              rex::chrono::Clock::QueryHostTickFrequency());
+    }
     // If any pipeline descriptions were corrupted (or the whole file has excess
     // bytes in the end), truncate to the last valid pipeline description.
     rex::filesystem::TruncateStdioFile(
@@ -1014,6 +1049,21 @@ bool PipelineCache::ConfigurePipeline(
     Pipeline* found_pipeline = it->second;
     if (!std::memcmp(&found_pipeline->description.description, &description, sizeof(description))) {
       PROFILE_PIPELINE_CACHE_HIT();
+      if (found_pipeline->background.load(std::memory_order_relaxed) == kBackgroundWaiting) {
+        uint8_t waiting = kBackgroundWaiting;
+        if (found_pipeline->background.compare_exchange_strong(waiting, kBackgroundTaken)) {
+          {
+            std::lock_guard<std::mutex> lock(creation_request_lock_);
+            creation_queue_.push(found_pipeline);
+            // Counted as done here: it is now an ordinary request.
+            if (++background_creation_done_ == background_creation_total_) {
+              REXGPU_INFO("All {} graphics pipelines from the storage queued for creation",
+                          background_creation_total_);
+            }
+          }
+          creation_request_cond_.notify_one();
+        }
+      }
       current_pipeline_ = found_pipeline;
       *pipeline_handle_out = found_pipeline;
       *root_signature_out = found_pipeline->root_signature.load(std::memory_order_acquire);
@@ -3227,6 +3277,7 @@ bool PipelineCache::PrepareRuntimeDescriptionForQueuedCreation(
 void PipelineCache::CreationThread(size_t thread_index) {
   while (true) {
     Pipeline* pipeline_to_create = nullptr;
+    bool from_background = false;
 
     // Check if need to shut down or set the completion event and dequeue the
     // pipeline if there is any.
@@ -3241,16 +3292,31 @@ void PipelineCache::CreationThread(size_t thread_index) {
         if (thread_index >= creation_threads_shutdown_from_) {
           return;
         }
-        creation_request_cond_.wait(lock);
-        continue;
+        // Nothing requested: a pipeline from the storage, unless a draw has taken it already.
+        // Not counted as busy, so nothing waiting for the requested pipelines waits for it.
+        while (!background_creation_queue_.empty()) {
+          Pipeline* candidate = background_creation_queue_.front();
+          background_creation_queue_.pop_front();
+          uint8_t waiting = kBackgroundWaiting;
+          if (candidate->background.compare_exchange_strong(waiting, kBackgroundTaken)) {
+            pipeline_to_create = candidate;
+            from_background = true;
+            break;
+          }
+        }
+        if (!pipeline_to_create) {
+          creation_request_cond_.wait(lock);
+          continue;
+        }
+      } else {
+        // Take the pipeline from the queue and increment the busy thread count
+        // until the pipeline is created - other threads must be able to dequeue
+        // requests, but can't set the completion event until the pipelines are
+        // fully created (rather than just started creating).
+        pipeline_to_create = creation_queue_.top();
+        creation_queue_.pop();
+        ++creation_threads_busy_;
       }
-      // Take the pipeline from the queue and increment the busy thread count
-      // until the pipeline is created - other threads must be able to dequeue
-      // requests, but can't set the completion event until the pipelines are
-      // fully created (rather than just started creating).
-      pipeline_to_create = creation_queue_.top();
-      creation_queue_.pop();
-      ++creation_threads_busy_;
     }
 
     PipelineRuntimeDescription runtime_description;
@@ -3266,7 +3332,17 @@ void PipelineCache::CreationThread(size_t thread_index) {
     // thread).
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
-      --creation_threads_busy_;
+      if (from_background) {
+        if (++background_creation_done_ == background_creation_total_) {
+          REXGPU_INFO("Created {} graphics pipelines from the storage in the background in {} "
+                      "milliseconds",
+                      background_creation_total_,
+                      (rex::chrono::Clock::QueryHostTickCount() - background_creation_start_) *
+                          1000 / rex::chrono::Clock::QueryHostTickFrequency());
+        }
+      } else {
+        --creation_threads_busy_;
+      }
     }
   }
 }

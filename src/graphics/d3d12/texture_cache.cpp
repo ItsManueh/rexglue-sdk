@@ -1210,6 +1210,8 @@ bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscal
       continue;
     }
     auto direct_queue = provider.GetDirectQueue();
+    // The tile mapping is a queue operation: after the submissions already ended.
+    command_processor_.AwaitSubmissionThread();
     D3D12_HEAP_DESC heap_desc = {};
     heap_desc.SizeInBytes = kScaledResolveHeapSize;
     heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;

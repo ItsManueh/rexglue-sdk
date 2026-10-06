@@ -110,6 +110,15 @@ class D3D12SharedMemory : public SharedMemory {
   D3D12_CPU_DESCRIPTOR_HANDLE buffer_descriptor_heap_start_;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> upload_buffer_pool_;
+  // Copies of one UploadRanges call, made after its pages are valid and protected.
+  struct UploadCopy {
+    uint8_t* mapping;
+    ID3D12Resource* buffer;
+    size_t buffer_offset;
+    size_t size;
+    uint32_t start;
+  };
+  std::vector<UploadCopy> upload_copies_;
 };
 
 }  // namespace rex::graphics::d3d12

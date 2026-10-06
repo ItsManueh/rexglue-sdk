@@ -350,7 +350,13 @@ class PipelineCache {
     D3D12Shader::D3D12Translation* pending_vertex_shader = nullptr;
     D3D12Shader::D3D12Translation* pending_pixel_shader = nullptr;
     uint8_t priority = 0;
+    // Pipelines from the storage created in the background: kBackgroundWaiting while in
+    // background_creation_queue_, kBackgroundTaken once a creation thread or a draw that needs it
+    // (which moves it to creation_queue_) has taken it.
+    std::atomic<uint8_t> background{0};
   };
+  static constexpr uint8_t kBackgroundWaiting = 1;
+  static constexpr uint8_t kBackgroundTaken = 2;
   struct PipelineCreationPriorityComparator {
     bool operator()(const Pipeline* a, const Pipeline* b) const {
       uint8_t priority_a = a ? a->priority : 0;
@@ -418,6 +424,13 @@ class PipelineCache {
   // possible. Protected with creation_request_lock_, notify_all
   // creation_request_cond_ when set.
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
+  // Pipelines from the storage that are created only while creation_queue_ is empty, so the game
+  // starts without waiting for them (d3d12_background_storage_pipelines). Protected with
+  // creation_request_lock_.
+  std::deque<Pipeline*> background_creation_queue_;
+  size_t background_creation_total_ = 0;
+  size_t background_creation_done_ = 0;
+  uint64_t background_creation_start_ = 0;
   std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads_;
 };
 

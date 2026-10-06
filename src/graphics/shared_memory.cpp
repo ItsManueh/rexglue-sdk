@@ -397,6 +397,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   if (AreRangesValidUnlocked(merged_ranges)) {
     return true;
   }
+  ++stat_slow_requests_;
 
   for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
@@ -505,9 +506,14 @@ std::string SharedMemory::TakeStats(uint32_t frames) {
   };
   std::string text = describe("memory uploaded", stat_uploaded_) + "; " +
                      describe("invalidated by the CPU", stat_invalidated_) +
-                     fmt::format(" in {:.0f} notifications/frame",
-                                 double(stat_invalidations_) * per_frame);
+                     fmt::format(" in {:.0f} notifications/frame; {:.0f} requests/frame took the "
+                                 "slow path, {:.0f} upload operations/frame",
+                                 double(stat_invalidations_) * per_frame,
+                                 double(stat_slow_requests_) * per_frame,
+                                 double(stat_upload_operations_) * per_frame);
   stat_invalidations_ = 0;
+  stat_slow_requests_ = 0;
+  stat_upload_operations_ = 0;
   return text;
 }
 
