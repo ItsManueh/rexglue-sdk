@@ -61,6 +61,22 @@ endif()
 set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL
     "Root of the fetched FidelityFX SDK source tree")
 
+# The FidelityFX version resource is UTF-16, which llvm-rc does not read: convert it to UTF-8 once
+# (without this a fresh checkout fails to build amd_fidelityfx_dx12 with clang).
+set(_rexglue_ffx_rc "${fidelityfx_SOURCE_DIR}/ffx-api/src/resource/ffx_api_dll.rc")
+if(WIN32 AND EXISTS "${_rexglue_ffx_rc}")
+    file(READ "${_rexglue_ffx_rc}" _rexglue_ffx_rc_bom LIMIT 2 HEX)
+    if(_rexglue_ffx_rc_bom STREQUAL "fffe")
+        execute_process(
+            COMMAND powershell -NoProfile -Command
+                "$p = '${_rexglue_ffx_rc}'; [IO.File]::WriteAllText($p, [IO.File]::ReadAllText($p), (New-Object Text.UTF8Encoding $false))"
+            RESULT_VARIABLE _rexglue_ffx_rc_result)
+        if(NOT _rexglue_ffx_rc_result EQUAL 0)
+            message(FATAL_ERROR "Could not convert ${_rexglue_ffx_rc} to UTF-8")
+        endif()
+    endif()
+endif()
+
 # ── Backend selection ────────────────────────────────────────────────────
 set(REXGLUE_FIDELITYFX_BACKEND "auto" CACHE STRING
     "FidelityFX backend to build (auto, vk, dx12)")
