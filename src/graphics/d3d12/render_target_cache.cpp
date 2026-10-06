@@ -3812,7 +3812,7 @@ std::string D3D12RenderTargetCache::TakeTransferStats(uint64_t frames) {
     RenderTargetKey key;
     key.key = key_bits;
     if (key.IsEmpty()) {
-      return std::string("nada");
+      return std::string("none");
     }
     return fmt::format("{}{} fmt{} msaa{} pitch{}", uint32_t(key.is_depth) ? "depth" : "color",
                        key.Is64bpp() ? "64" : "32", uint32_t(key.resource_format),

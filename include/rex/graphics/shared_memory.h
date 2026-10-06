@@ -79,6 +79,8 @@ class SharedMemory {
   // ensures the host GPU memory backing the range are resident. Returns true if
   // the range has been fully updated and is usable.
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
+  // Whether every page of the sorted, merged ranges is valid, read without the global lock.
+  bool AreRangesValidUnlocked(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) const;
   bool RequestRange(uint32_t start, uint32_t length);
 
   // Marks the range and, if not exact_range, potentially its surroundings

@@ -170,6 +170,9 @@ class CommandProcessor {
   virtual void MakeCoherent();
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
+  // Called repeatedly while the command processor waits for new commands (work that completes
+  // asynchronously on the host GPU, such as occlusion query results).
+  virtual void OnWaitIdle() {}
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}

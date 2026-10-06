@@ -243,6 +243,9 @@ class D3D12CommandProcessor : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
 
+  void PrepareForWait() override;
+  void OnWaitIdle() override;
+
  private:
   static constexpr uint32_t kQueueFrames = 3;
 
@@ -458,9 +461,11 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   bool InitializeOcclusionQueryResources();
   void ShutdownOcclusionQueryResources();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address,
-                              xenos::xe_gpu_depth_sample_counts* sample_counts);
+  bool BeginGuestOcclusionQuery(uint32_t sample_count_address,
+                                xenos::xe_gpu_depth_sample_counts* sample_counts);
+  bool EndGuestOcclusionQuery(uint32_t sample_count_address);
+  // Writes the results of the queries whose submission the host GPU has completed.
+  void CompletePendingOcclusionQueries();
   bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
   void DisableHostOcclusionQueries();
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
@@ -740,6 +745,16 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+  // Ended queries waiting for the host GPU; ordered by submission. The guest sees its own
+  // "not finished" markers in the end block until the result is written.
+  struct PendingOcclusionQuery {
+    uint32_t host_index;
+    uint32_t end_address;  // 0 = superseded by a newer query on the same block
+    uint64_t submission;
+  };
+  std::deque<PendingOcclusionQuery> pending_occlusion_queries_;
+  // Submission that last used each host query index (0 = free).
+  std::vector<uint64_t> occlusion_query_index_submission_;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

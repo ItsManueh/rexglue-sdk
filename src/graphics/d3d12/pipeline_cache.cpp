@@ -50,6 +50,11 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm, false, "GPU/D3D12", "Dump DXBC disassembly");
+REXCVAR_DEFINE_BOOL(d3d12_await_pipelines_at_submission, false, "GPU/D3D12",
+                    "With async_shader_compilation, still wait at the end of every submission for "
+                    "the pipelines being created (the frame stalls until the driver has compiled "
+                    "them). Off: draws keep being skipped until their pipeline is ready, without "
+                    "stalling");
 
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm_dxilconv, false, "GPU/D3D12",
                     "Dump DXIL conversion disassembly");
@@ -762,6 +767,13 @@ void PipelineCache::EndSubmission() {
     shader_storage_file_flush_needed_ = false;
     pipeline_storage_file_flush_needed_ = false;
   }
+  // With asynchronous compilation, every draw whose pipeline was not ready yet has been skipped
+  // (D3D12CommandProcessor::IssueDraw), so nothing in the submission refers to a pipeline still
+  // being created and there is nothing to wait for: the creation threads keep compiling while the
+  // game runs, instead of stalling the frame on the driver (the first-use hitches).
+  if (REXCVAR_GET(async_shader_compilation) && !REXCVAR_GET(d3d12_await_pipelines_at_submission)) {
+    return;
+  }
   if (!creation_threads_.empty()) {
     CreateQueuedPipelinesOnProcessorThread();
     // Await creation of all queued pipelines.
@@ -909,8 +921,9 @@ bool PipelineCache::ConfigurePipeline(
   assert_not_null(pipeline_handle_out);
   assert_not_null(root_signature_out);
 
-  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
-                   pixel_shader != nullptr;
+  // Depth-only draws (no pixel shader: shadow maps, depth prepasses) are created asynchronously
+  // too; their root signature is recomputed once the vertex shader is translated.
+  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty();
 
   // Ensure shaders are translated - needed now for GetCurrentStateDescription.
   // Edge flags are not supported yet (because polygon primitives are not).
@@ -3166,6 +3179,7 @@ bool PipelineCache::PrepareRuntimeDescriptionForQueuedCreation(
     return translation->is_valid();
   };
 
+  bool vertex_was_pending = pipeline->pending_vertex_shader != nullptr;
   if (pipeline->pending_vertex_shader) {
     D3D12Shader::D3D12Translation* pending_vertex = pipeline->pending_vertex_shader;
     pipeline->pending_vertex_shader = nullptr;
@@ -3186,6 +3200,20 @@ bool PipelineCache::PrepareRuntimeDescriptionForQueuedCreation(
     ID3D12RootSignature* root_signature = command_processor_.GetRootSignature(
         static_cast<const DxbcShader*>(&runtime_description.vertex_shader->shader()),
         static_cast<const DxbcShader*>(&pending_pixel->shader()), tessellated);
+    if (!root_signature) {
+      return false;
+    }
+    runtime_description.root_signature = root_signature;
+    pipeline->root_signature.store(root_signature, std::memory_order_release);
+  } else if (vertex_was_pending && !runtime_description.pixel_shader) {
+    // Depth-only pipeline: the placeholder root signature was made before the vertex shader was
+    // translated; make the real one from the translated vertex shader.
+    bool tessellated = Shader::IsHostVertexShaderTypeDomain(
+        DxbcShaderTranslator::Modification(runtime_description.vertex_shader->modification())
+            .vertex.host_vertex_shader_type);
+    ID3D12RootSignature* root_signature = command_processor_.GetRootSignature(
+        static_cast<const DxbcShader*>(&runtime_description.vertex_shader->shader()), nullptr,
+        tessellated);
     if (!root_signature) {
       return false;
     }

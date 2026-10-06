@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -304,7 +305,8 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
       if (i == valid_block_last && (valid_page_last & 63) != 63) {
         valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
       }
-      system_page_flags_valid_[i] |= valid_bits;
+      std::atomic_ref<uint64_t> valid(system_page_flags_valid_[i]);
+      valid.store(valid.load(std::memory_order_relaxed) | valid_bits, std::memory_order_release);
       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
     }
@@ -384,6 +386,17 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
   }
   merged_ranges.resize(merged_write + 1);
+
+  // Fast path: nearly every draw only uses data that is already uploaded and that the CPU has not
+  // written since, and then the global lock is not needed. That lock is also taken by the guest
+  // threads for every kernel object wait, and waiting for it cost the command processor about a
+  // tenth of its time in split screen. Valid pages are always allocated, and the result is as
+  // current as with the lock: an invalidation made before the guest submitted these commands is
+  // ordered before the ring buffer write the command processor has read, and one racing with the
+  // check could equally happen right after the locked check.
+  if (AreRangesValidUnlocked(merged_ranges)) {
+    return true;
+  }
 
   for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
@@ -498,6 +511,31 @@ std::string SharedMemory::TakeStats(uint32_t frames) {
   return text;
 }
 
+bool SharedMemory::AreRangesValidUnlocked(
+    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) const {
+  for (const std::pair<uint32_t, uint32_t>& range : ranges) {
+    uint32_t page_first = range.first >> page_size_log2_;
+    uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+    uint32_t block_first = page_first >> 6;
+    uint32_t block_last = page_last >> 6;
+    for (uint32_t i = block_first; i <= block_last; ++i) {
+      uint64_t mask = UINT64_MAX;
+      if (i == block_first) {
+        mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+      }
+      if (i == block_last && (page_last & 63) != 63) {
+        mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+      }
+      uint64_t valid = std::atomic_ref<uint64_t>(const_cast<uint64_t&>(system_page_flags_valid_[i]))
+                           .load(std::memory_order_acquire);
+      if ((valid & mask) != mask) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   std::pair<uint32_t, uint32_t> range(start, length);
   return RequestRanges(&range, 1);
@@ -558,7 +596,9 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     if (i == block_last && (page_last & 63) != 63) {
       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
-    system_page_flags_valid_[i] &= ~invalidate_bits;
+    std::atomic_ref<uint64_t> valid(system_page_flags_valid_[i]);
+    valid.store(valid.load(std::memory_order_relaxed) & ~invalidate_bits,
+                std::memory_order_release);
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
   }
 
