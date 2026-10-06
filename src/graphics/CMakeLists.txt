@@ -112,6 +112,25 @@ target_include_directories(rexgpu-xenos PRIVATE
 
 target_compile_options(rexgpu-xenos PRIVATE -Wno-unused-variable)
 
+# Profile-guided optimization of the plugin, whose command processor thread is the busiest one:
+# REXGLUE_PGO_GENERATE builds it instrumented (it writes .profraw files, see LLVM_PROFILE_FILE),
+# REXGLUE_PGO_USE optimizes it with the merged profile (llvm-profdata merge). Only this target:
+# the runtime library exports all its symbols, and instrumented objects would add the profile
+# counters to its export list.
+option(REXGLUE_PGO_GENERATE "Build the GPU plugin instrumented for profile-guided optimization" OFF)
+set(REXGLUE_PGO_USE "" CACHE FILEPATH "Merged profile (.profdata) to optimize the GPU plugin with")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    if(REXGLUE_PGO_GENERATE)
+        target_compile_options(rexgpu-xenos PRIVATE -fprofile-instr-generate)
+        target_compile_definitions(rexgpu-xenos PRIVATE REXGLUE_PGO_GENERATE=1)
+        target_link_options(rexgpu-xenos PRIVATE -fprofile-instr-generate)
+    elseif(REXGLUE_PGO_USE)
+        # Functions changed since the profile was recorded are optimized as usual.
+        target_compile_options(rexgpu-xenos PRIVATE "-fprofile-instr-use=${REXGLUE_PGO_USE}"
+            -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+    endif()
+endif()
+
 rex_target_pch(rexgpu-xenos
     <mutex>
     <unordered_map>

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -2171,12 +2172,30 @@ bool D3D12CommandProcessor::PrepareSmaaResources(uint32_t width, uint32_t height
   return true;
 }
 
+#if REXGLUE_PGO_GENERATE
+// Instrumented build (REXGLUE_PGO_GENERATE): the profile is normally written when the process
+// exits, which a training session that closes the game by force never reaches.
+extern "C" int __llvm_profile_write_file(void);
+#endif
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+#if REXGLUE_PGO_GENERATE
+  {
+    static auto last_write = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_write > std::chrono::seconds(20)) {
+      last_write = now;
+      __llvm_profile_write_file();
+    }
+  }
+#endif
   GpuProfileScope gpu_profile_swap(*this, GpuProfileCategory::kSwap);
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
+  // Every vertex buffer is requested again in the next frame, also one at the same address and of
+  // the same size, whose data the CPU may have rewritten (like Xenia, which only keeps the
+  // residency within a frame).
+  InvalidateAllVertexBufferResidency();
 
   if (!graphics_system_)
     return;
@@ -2649,6 +2668,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
+  // The guest has handed over a new command buffer: memory it rewrites from now on is for later
+  // commands.
+  shared_memory_->StartStreamingCopies();
   if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {
     EndSubmission(false);
@@ -2943,7 +2965,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+      if (!shared_memory_->RequestVertexRange(vfetch_constant.address << 2,
+                                              vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
             "shared memory",
@@ -3927,6 +3950,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
     render_target_cache_->BeginSubmission();
 
+    shared_memory_->StartStreamingCopies();
+
     primitive_processor_->BeginSubmission();
 
     texture_cache_->BeginSubmission(submission_current_);
@@ -3969,6 +3994,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+
+    shared_memory_->SetStreamingFrame(frame_current_);
   }
 
   return true;

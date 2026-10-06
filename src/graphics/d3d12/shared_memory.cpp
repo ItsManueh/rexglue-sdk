@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -357,6 +358,33 @@ bool D3D12SharedMemory::UploadRanges(
                                      UINT64(copy.size));
   }
   return succeeded;
+}
+
+bool D3D12SharedMemory::UploadStreamedRange(uint32_t start, uint32_t length) {
+  CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+  auto& command_list = command_processor_.GetDeferredCommandList();
+  while (length != 0) {
+    ID3D12Resource* upload_buffer;
+    size_t upload_buffer_offset, upload_buffer_size;
+    uint8_t* upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
+        command_processor_.GetCurrentSubmission(), length, 16, &upload_buffer,
+        &upload_buffer_offset, &upload_buffer_size, nullptr);
+    if (upload_buffer_mapping == nullptr) {
+      REXGPU_ERROR("Shared memory: Failed to get an upload buffer for streamed vertices");
+      return false;
+    }
+    // The pool rounds the size up to the alignment: only the requested bytes are copied.
+    const uint32_t copy_size = uint32_t(std::min(upload_buffer_size, size_t(length)));
+    std::memcpy(upload_buffer_mapping, memory().TranslatePhysical(start), copy_size);
+    command_list.D3DCopyBufferRegion(buffer_, start, upload_buffer, UINT64(upload_buffer_offset),
+                                     UINT64(copy_size));
+    stat_streamed_bytes_ += copy_size;
+    ++stat_streamed_copies_;
+    start += copy_size;
+    length -= copy_size;
+  }
+  return true;
 }
 
 }  // namespace rex::graphics::d3d12

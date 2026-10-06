@@ -80,6 +80,7 @@ class D3D12SharedMemory : public SharedMemory {
                                         uint32_t length_allocations) override;
 
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  bool UploadStreamedRange(uint32_t start, uint32_t length) override;
 
  private:
   D3D12CommandProcessor& command_processor_;

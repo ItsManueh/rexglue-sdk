@@ -11,9 +11,11 @@
  */
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -83,6 +85,20 @@ class SharedMemory {
   bool AreRangesValidUnlocked(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) const;
   bool RequestRange(uint32_t start, uint32_t length);
 
+  // RequestRange for the vertices of a draw. Small vertex buffers in memory the CPU rewrites
+  // every frame (hot pages, see IsStreamable) are streamed: exactly the requested bytes are
+  // copied from guest memory when the draw is processed, without making the pages valid and
+  // write-protecting them again (a system call per upload, then an access violation in the game
+  // thread that writes them next). Only for vertex data: other users rely on the protection to
+  // learn about changes (the texture cache's watches).
+  bool RequestVertexRange(uint32_t start, uint32_t length);
+
+  // Streaming bookkeeping: call when a frame starts with its number, and whenever the guest has
+  // handed over a new command buffer (memory it rewrites from then on is for later commands, so
+  // ranges streamed before must be copied again).
+  void SetStreamingFrame(uint64_t frame);
+  void StartStreamingCopies() { streamed_ranges_.clear(); }
+
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
   // count optimization) as modified by the CPU, also invalidating GPU-written
@@ -148,6 +164,9 @@ class SharedMemory {
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
 
+  // Copies a byte range from guest memory to the buffer, for streaming.
+  virtual bool UploadStreamedRange(uint32_t start, uint32_t length) { return false; }
+
   using PerMegabyte = std::array<uint64_t, (kBufferSize >> 20)>;
   PerMegabyte stat_uploaded_{};
   PerMegabyte stat_invalidated_{};
@@ -156,6 +175,8 @@ class SharedMemory {
   // that had to take the slow path.
   uint64_t stat_upload_operations_ = 0;
   uint64_t stat_slow_requests_ = 0;
+  uint64_t stat_streamed_bytes_ = 0;
+  uint64_t stat_streamed_copies_ = 0;
 
  private:
   memory::Memory& memory_;
@@ -179,6 +200,15 @@ class SharedMemory {
   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
   // Reused by RequestRanges (called for every draw) instead of allocating each time.
   std::vector<std::pair<uint32_t, uint32_t>> merged_ranges_;
+
+  // Streaming of hot pages. For each page, the last two frames in which a CPU write invalidated
+  // it (0 = never), written under the global lock by MemoryInvalidationCallback and read without
+  // it; the current frame; and the {start, length} streamed since the last StartStreamingCopies.
+  std::vector<uint32_t> page_cpu_write_frame_;
+  std::vector<uint32_t> page_cpu_write_frame_previous_;
+  std::atomic<uint32_t> streaming_frame_{1};
+  std::unordered_set<uint64_t> streamed_ranges_;
+  bool IsStreamable(uint32_t start, uint32_t length) const;
 
   // Mutex between the guest memory subsystem and the command processor, to be
   // locked when checking or updating validity of pages/ranges and when firing

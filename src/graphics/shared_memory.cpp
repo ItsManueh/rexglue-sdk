@@ -20,10 +20,32 @@
 #include <rex/bit.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
+#include <rex/cvar.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 
+REXCVAR_DEFINE_BOOL(shared_memory_stream_hot_vertices, true, "GPU",
+                    "Copy small vertex buffers in memory the CPU rewrites every frame straight "
+                    "from guest memory for each draw, instead of write-protecting their pages "
+                    "after every upload")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
+
+namespace {
+
+// Streamed requests are at most this big: a larger one is a whole buffer the title draws parts of
+// (its dynamic vertex buffer is bound whole), where copying every byte would cost more than the
+// pages it actually rewrote.
+constexpr uint32_t kMaxStreamedRequest = 256 * 1024;
+// A page is hot when the CPU rewrote it in two frames at most this far apart...
+constexpr uint32_t kHotWriteInterval = 8;
+// ...and is streamed for this many frames after the last such write. Streamed pages are not
+// watched, so no further write is seen: afterwards they are uploaded and watched again once, to
+// check that they are still rewritten (once every two seconds).
+constexpr uint32_t kStreamingFrames = 120;
+
+}  // namespace
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
@@ -36,6 +58,8 @@ SharedMemory::~SharedMemory() {
 void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
+  page_cpu_write_frame_.assign(system_page_flags_valid_.size() << 6, 0);
+  page_cpu_write_frame_previous_.assign(system_page_flags_valid_.size() << 6, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
 
   memory_invalidation_callback_handle_ =
@@ -507,10 +531,15 @@ std::string SharedMemory::TakeStats(uint32_t frames) {
   std::string text = describe("memory uploaded", stat_uploaded_) + "; " +
                      describe("invalidated by the CPU", stat_invalidated_) +
                      fmt::format(" in {:.0f} notifications/frame; {:.0f} requests/frame took the "
-                                 "slow path, {:.0f} upload operations/frame",
+                                 "slow path, {:.0f} upload operations/frame; streamed {:.2f} "
+                                 "MB/frame in {:.0f} copies/frame",
                                  double(stat_invalidations_) * per_frame,
                                  double(stat_slow_requests_) * per_frame,
-                                 double(stat_upload_operations_) * per_frame);
+                                 double(stat_upload_operations_) * per_frame,
+                                 double(stat_streamed_bytes_) / kMB * per_frame,
+                                 double(stat_streamed_copies_) * per_frame);
+  stat_streamed_bytes_ = 0;
+  stat_streamed_copies_ = 0;
   stat_invalidations_ = 0;
   stat_slow_requests_ = 0;
   stat_upload_operations_ = 0;
@@ -545,6 +574,57 @@ bool SharedMemory::AreRangesValidUnlocked(
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   std::pair<uint32_t, uint32_t> range(start, length);
   return RequestRanges(&range, 1);
+}
+
+void SharedMemory::SetStreamingFrame(uint64_t frame) {
+  // Frame numbers start at 1; 0 means "never written".
+  streaming_frame_.store(uint32_t(frame) ? uint32_t(frame) : 1, std::memory_order_relaxed);
+}
+
+bool SharedMemory::IsStreamable(uint32_t start, uint32_t length) const {
+  if (!length || length > kMaxStreamedRequest || start >= kBufferSize ||
+      kBufferSize - start < length || page_cpu_write_frame_.empty() ||
+      !REXCVAR_GET(shared_memory_stream_hot_vertices)) {
+    return false;
+  }
+  const uint32_t frame = streaming_frame_.load(std::memory_order_relaxed);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    // Every page invalid: valid ones hold data the normal path keeps current (or the GPU wrote,
+    // which a copy from guest memory would overwrite).
+    uint64_t valid = std::atomic_ref<uint64_t>(const_cast<uint64_t&>(
+                                                   system_page_flags_valid_[page >> 6]))
+                         .load(std::memory_order_acquire);
+    if (valid & (uint64_t(1) << (page & 63))) {
+      return false;
+    }
+    const uint32_t last = std::atomic_ref<uint32_t>(const_cast<uint32_t&>(
+                                                        page_cpu_write_frame_[page]))
+                              .load(std::memory_order_relaxed);
+    const uint32_t previous = std::atomic_ref<uint32_t>(const_cast<uint32_t&>(
+                                                            page_cpu_write_frame_previous_[page]))
+                                  .load(std::memory_order_relaxed);
+    if (!last || !previous || last - previous > kHotWriteInterval ||
+        frame - last > kStreamingFrames) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SharedMemory::RequestVertexRange(uint32_t start, uint32_t length) {
+  if (!IsStreamable(start, length)) {
+    return RequestRange(start, length);
+  }
+  // Already copied for the commands the guest has handed over so far: unchanged since.
+  if (!streamed_ranges_.insert(uint64_t(start) << 32 | length).second) {
+    return true;
+  }
+  if (!EnsureHostGpuMemoryAllocated(start, length)) {
+    return false;
+  }
+  return UploadStreamedRange(start, length);
 }
 
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(
@@ -593,6 +673,21 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   ++stat_invalidations_;
   stat_invalidated_[(page_first << page_size_log2_) >> 20] +=
       uint64_t(page_last - page_first + 1) << page_size_log2_;
+
+  // The whole invalidated block: after this, writes to the rest of it cause no further
+  // notification until its pages are watched again.
+  if (!page_cpu_write_frame_.empty()) {
+    const uint32_t frame = streaming_frame_.load(std::memory_order_relaxed);
+    for (uint32_t page = page_first; page <= page_last; ++page) {
+      std::atomic_ref<uint32_t> last(page_cpu_write_frame_[page]);
+      const uint32_t last_frame = last.load(std::memory_order_relaxed);
+      if (last_frame != frame) {
+        std::atomic_ref<uint32_t>(page_cpu_write_frame_previous_[page])
+            .store(last_frame, std::memory_order_relaxed);
+        last.store(frame, std::memory_order_relaxed);
+      }
+    }
+  }
 
   for (uint32_t i = block_first; i <= block_last; ++i) {
     uint64_t invalidate_bits = UINT64_MAX;
